@@ -5,7 +5,6 @@
 
 #include <cinttypes>
 
-#include "cloud/aws/aws_env.h"
 #include "cloud/filename.h"
 #include "cloud/manifest_reader.h"
 #include "env/composite_env_wrapper.h"
@@ -97,7 +96,6 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
   if (!cenv->info_log_) {
     cenv->info_log_ = options.info_log;
   }
-
   // Use a constant sized SST File Manager if necesary.
   // NOTE: if user already passes in an SST File Manager, we will respect user's
   // SST File Manager instead.
@@ -120,39 +118,40 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
         local_dbname);  // MJR: TODO: Move into sanitize
   }
 
-  st = cenv->SanitizeDirectory(options, local_dbname, read_only);
+  // If cloud manifest is already loaded, this means the directory has been
+  // sanitized (possibly by the call to ListColumnFamilies())
+  if (cenv->GetCloudManifest() == nullptr) {
+    st = cenv->SanitizeDirectory(options, local_dbname, read_only);
 
-  if (st.ok()) {
-    st = cenv->LoadCloudManifest(local_dbname, read_only);
-  }
-  if (!st.ok()) {
-    return st;
+    if (st.ok()) {
+      st = cenv->LoadCloudManifest(local_dbname, read_only);
+    }
+    if (!st.ok()) {
+      return st;
+    }
   }
   // If a persistent cache path is specified, then we set it in the options.
   if (!persistent_cache_path.empty() && persistent_cache_size_gb) {
     // Get existing options. If the persistent cache is already set, then do
     // not make any change. Otherwise, configure it.
-    void* bopt = options.table_factory->GetOptions();
-    if (bopt != nullptr) {
-      BlockBasedTableOptions* tableopt =
-          static_cast<BlockBasedTableOptions*>(bopt);
-      if (!tableopt->persistent_cache) {
-        PersistentCacheConfig config(
-            local_env, persistent_cache_path,
-            persistent_cache_size_gb * 1024L * 1024L * 1024L, options.info_log);
-        auto pcache = std::make_shared<BlockCacheTier>(config);
-        st = pcache->Open();
-        if (st.ok()) {
-          tableopt->persistent_cache = pcache;
-          Log(InfoLogLevel::INFO_LEVEL, options.info_log,
-              "Created persistent cache %s with size %" PRIu64 "GB",
-              persistent_cache_path.c_str(), persistent_cache_size_gb);
-        } else {
-          Log(InfoLogLevel::INFO_LEVEL, options.info_log,
-              "Unable to create persistent cache %s. %s",
-              persistent_cache_path.c_str(), st.ToString().c_str());
-          return st;
-        }
+    auto* tableopt =
+        options.table_factory->GetOptions<BlockBasedTableOptions>();
+    if (tableopt != nullptr && !tableopt->persistent_cache) {
+      PersistentCacheConfig config(
+          local_env, persistent_cache_path,
+          persistent_cache_size_gb * 1024L * 1024L * 1024L, options.info_log);
+      auto pcache = std::make_shared<BlockCacheTier>(config);
+      st = pcache->Open();
+      if (st.ok()) {
+        tableopt->persistent_cache = pcache;
+        Log(InfoLogLevel::INFO_LEVEL, options.info_log,
+            "Created persistent cache %s with size %" PRIu64 "GB",
+            persistent_cache_path.c_str(), persistent_cache_size_gb);
+      } else {
+        Log(InfoLogLevel::INFO_LEVEL, options.info_log,
+            "Unable to create persistent cache %s. %s",
+            persistent_cache_path.c_str(), st.ToString().c_str());
+        return st;
       }
     }
   }
@@ -214,7 +213,7 @@ Status DBCloudImpl::Savepoint() {
   std::vector<LiveFileMetaData> live_files;
   GetLiveFilesMetaData(&live_files);
 
-  auto& provider = cenv->GetCloudEnvOptions().storage_provider;
+  auto provider = cenv->GetStorageProvider();
   // If an sst file does not exist in the destination path, then remember it
   std::vector<std::string> to_copy;
   for (auto onefile : live_files) {
@@ -337,7 +336,7 @@ Status DBCloudImpl::DoCheckpointToCloud(
   thread_statuses.resize(thread_count);
 
   auto do_copy = [&](size_t threadId) {
-    auto& provider = cenv->GetCloudEnvOptions().storage_provider;
+    auto provider = cenv->GetStorageProvider();
     while (true) {
       size_t idx = next_file_to_copy.fetch_add(1);
       if (idx >= files_to_copy.size()) {
@@ -404,6 +403,26 @@ Status DBCloudImpl::ExecuteRemoteCompactionRequest(
     outfile->pathname = cenv->RemapFilename(outfile->pathname);
   }
   return Status::OK();
+}
+
+Status DBCloud::ListColumnFamilies(const DBOptions& db_options,
+                                   const std::string& name,
+                                   std::vector<std::string>* column_families) {
+  CloudEnvImpl* cenv = static_cast<CloudEnvImpl*>(db_options.env);
+
+  Env* local_env = cenv->GetBaseEnv();
+  local_env->CreateDirIfMissing(name);
+
+  Status st;
+  st = cenv->SanitizeDirectory(db_options, name, false);
+  if (st.ok()) {
+    st = cenv->LoadCloudManifest(name, false);
+  }
+  if (st.ok()) {
+    st = DB::ListColumnFamilies(db_options, name, column_families);
+  }
+
+  return st;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

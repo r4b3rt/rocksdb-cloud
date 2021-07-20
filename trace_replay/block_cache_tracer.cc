@@ -19,8 +19,6 @@
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
-const unsigned int kCharSize = 1;
-
 bool ShouldTrace(const Slice& block_key, const TraceOptions& trace_options) {
   if (trace_options.sampling_frequency == 0 ||
       trace_options.sampling_frequency == 1) {
@@ -28,8 +26,7 @@ bool ShouldTrace(const Slice& block_key, const TraceOptions& trace_options) {
   }
   // We use spatial downsampling so that we have a complete access history for a
   // block.
-  return 0 == fastrange64(GetSliceNPHash64(block_key),
-                          trace_options.sampling_frequency);
+  return 0 == GetSliceRangedNPHash(block_key, trace_options.sampling_frequency);
 }
 }  // namespace
 
@@ -130,7 +127,22 @@ Status BlockCacheTraceWriter::WriteBlockAccess(
   if (BlockCacheTraceHelper::IsGetOrMultiGet(record.caller)) {
     PutFixed64(&trace.payload, record.get_id);
     trace.payload.push_back(record.get_from_user_specified_snapshot);
-    PutLengthPrefixedSlice(&trace.payload, referenced_key);
+    Slice rk = referenced_key;
+    std::string rkStorage;
+    if ((trace_options_.filter & kTraceFilterReferencedKey) != 0) {
+      ParsedInternalKey pk;
+      Status st = ParseInternalKey(rk, &pk);
+      if (!st.ok()) {
+        return st;
+      }
+      if (pk.user_key.size() > 4) {
+        // first 4 is TableId
+        pk.user_key = Slice(pk.user_key.data(), 4);
+      }
+      AppendInternalKey(&rkStorage, pk);
+      rk = rkStorage;
+    }
+    PutLengthPrefixedSlice(&trace.payload, rk);
   }
   if (BlockCacheTraceHelper::IsGetOrMultiGetOnDataBlock(record.block_type,
                                                         record.caller)) {
@@ -216,6 +228,8 @@ Status BlockCacheTraceReader::ReadAccess(BlockCacheTraceRecord* record) {
   record->access_timestamp = trace.ts;
   record->block_type = trace.type;
   Slice enc_slice = Slice(trace.payload);
+
+  const unsigned int kCharSize = 1;
 
   Slice block_key;
   if (!GetLengthPrefixedSlice(&enc_slice, &block_key)) {
@@ -306,8 +320,8 @@ Status BlockCacheTraceReader::ReadAccess(BlockCacheTraceRecord* record) {
 
 BlockCacheHumanReadableTraceWriter::~BlockCacheHumanReadableTraceWriter() {
   if (human_readable_trace_file_writer_) {
-    human_readable_trace_file_writer_->Flush();
-    human_readable_trace_file_writer_->Close();
+    human_readable_trace_file_writer_->Flush().PermitUncheckedError();
+    human_readable_trace_file_writer_->Close().PermitUncheckedError();
   }
 }
 

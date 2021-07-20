@@ -5,6 +5,7 @@
 #include <memory>
 #include <unordered_map>
 
+#include "rocksdb/cache.h"
 #include "rocksdb/env.h"
 #include "rocksdb/status.h"
 
@@ -81,6 +82,9 @@ class AwsCloudAccessCredentials {
   std::string secret_key;
   std::string config_file;
   AwsAccessType type{AwsAccessType::kUndefined};
+
+  // If non-nullptr, all of the above options are ignored.
+  std::shared_ptr<Aws::Auth::AWSCredentialsProvider> provider;
 };
 
 // Defines parameters required to connect to Kafka
@@ -176,8 +180,26 @@ class CloudEnvOptions {
   LogType log_type;
   std::shared_ptr<CloudLogController> cloud_log_controller;
 
-  // Specifies the class responsible for writing objects to the cloud
+  // Specifies the class responsible for accessing objects in the cloud.
+  // A null value indicates that the default storage provider based on
+  // the cloud type be used. For example, if cloud_type is kCloudAws, then
+  // the S3 storage provider would be used by default.
+  // Default:  null
   std::shared_ptr<CloudStorageProvider> storage_provider;
+
+  // Specifies the amount of sst files to be cached in local storage.
+  // If non-null, then the local storage would be used as a file cache.
+  // The Get or a Scan request on the database generates a random read
+  // request on the sst file and such a request causes the sst file to
+  // be inserted into the local file cache.
+  // A compaction request generates a sequential read request on the sst
+  // file and it does not cause the sst file to be inserted into the
+  // local file cache.
+  // A memtable flush generates a write requst to a new sst file and this
+  // sst file is not inserted into the local file cache.
+  // Cannot be set if keep_local_log_files is true.
+  // Default: null (disabled)
+  std::shared_ptr<Cache> sst_file_cache;
 
   // Access credentials
   AwsCloudAccessCredentials credentials;
@@ -185,13 +207,13 @@ class CloudEnvOptions {
   // Only used if keep_local_log_files is true and log_type is kKafka.
   KafkaLogOptions kafka_log_options;
 
-  //
   // If true,  then sst files are stored locally and uploaded to the cloud in
   // the background. On restart, all files from the cloud that are not present
   // locally are downloaded.
   // If false, then local sst files are created, uploaded to cloud immediately,
   //           and local file is deleted. All reads are satisfied by fetching
   //           data from the cloud.
+  // Cannot be set if sst_file_cache is enabled.
   // Default:  false
   bool keep_local_sst_files;
 
@@ -314,9 +336,11 @@ class CloudEnvOptions {
       bool _use_aws_transfer_manager = false,
       int _number_objects_listed_in_one_iteration = 5000,
       int _constant_sst_file_size_in_sst_file_manager = -1,
-      bool _skip_cloud_files_in_getchildren = false)
+      bool _skip_cloud_files_in_getchildren = false,
+      std::shared_ptr<Cache> _sst_file_cache = nullptr)
       : cloud_type(_cloud_type),
         log_type(_log_type),
+        sst_file_cache(_sst_file_cache),
         keep_local_sst_files(_keep_local_sst_files),
         keep_local_log_files(_keep_local_log_files),
         purger_periodicity_millis(_purger_periodicity_millis),
@@ -346,6 +370,11 @@ class CloudEnvOptions {
   void TEST_Initialize(const std::string& name_prefix,
                        const std::string& object_path,
                        const std::string& region = "");
+
+  // Is the sst file cache configured?
+  bool hasSstFileCache() {
+    return sst_file_cache != nullptr && sst_file_cache->GetCapacity() > 0;
+  }
 };
 
 struct CheckpointToCloudOptions {
@@ -366,9 +395,9 @@ class CloudEnv : public Env {
 
   CloudEnv(const CloudEnvOptions& options, Env* base,
            const std::shared_ptr<Logger>& logger);
-
  public:
   std::shared_ptr<Logger> info_log_;  // informational messages
+
   virtual ~CloudEnv();
   // Returns the underlying env
   Env* GetBaseEnv() { return base_env_; }
@@ -394,6 +423,10 @@ class CloudEnv : public Env {
   virtual Status DeleteDbid(const std::string& bucket_prefix,
                             const std::string& dbid) = 0;
 
+  Logger* GetLogger() const { return info_log_.get(); }
+  std::shared_ptr<CloudStorageProvider> GetStorageProvider() const {
+    return cloud_env_options.storage_provider;
+  }
   // The SrcBucketName identifies the cloud storage bucket and
   // GetSrcObjectPath specifies the path inside that bucket
   // where data files reside. The specified bucket is used in

@@ -101,7 +101,7 @@ Status DBImpl::doCompact(const CompactionOptions& compact_options,
 
   c.reset(cfd->compaction_picker()->CompactFiles(
       compact_options, input_files, output_level, version->storage_info(),
-      *cfd->GetLatestMutableCFOptions(), output_path_id));
+      *cfd->GetLatestMutableCFOptions(), mutable_db_options_, output_path_id));
   assert(c != nullptr);
   c->SetInputVersion(version);
 
@@ -151,13 +151,15 @@ Status DBImpl::doCompact(const CompactionOptions& compact_options,
   // remove this compaction job from the list of compactions
   c->ReleaseCompactionFiles(s);
 
+#ifndef ROCKSDB_LITE
   // Make sure SstFileManager does its bookkeeping
   auto sfm = static_cast<SstFileManagerImpl*>(
       immutable_db_options_.sst_file_manager.get());
   if (sfm) {
     sfm->OnCompactionCompletion(c.get());
   }
-
+#endif // ROCKSDB_LITE
+  
   // remove our iterator
   ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
 

@@ -1,5 +1,6 @@
 //  Copyright (c) 2016-present, Rockset, Inc.  All rights reserved.
 //
+#ifndef ROCKSDB_LITE
 #include "cloud/aws/aws_env.h"
 
 #include <chrono>
@@ -18,7 +19,7 @@
 #include "rocksdb/cloud/cloud_storage_provider.h"
 #include "rocksdb/env.h"
 #include "rocksdb/status.h"
-#include "util/stderr_logger.h"
+#include "rocksdb/utilities/options_type.h"
 #include "util/string_util.h"
 
 #ifdef USE_AWS
@@ -41,16 +42,6 @@ static const std::unordered_map<std::string, AwsAccessType> AwsAccessTypeMap = {
     {"anonymous", AwsAccessType::kAnonymous},
 };
 
-template <typename T>
-bool ParseEnum(const std::unordered_map<std::string, T>& type_map,
-               const std::string& type, T* value) {
-  auto iter = type_map.find(type);
-  if (iter != type_map.end()) {
-    *value = iter->second;
-    return true;
-  }
-  return false;
-}
 
 AwsAccessType AwsCloudAccessCredentials::GetAccessType() const {
   if (type != AwsAccessType::kUndefined) {
@@ -115,6 +106,11 @@ Status AwsCloudAccessCredentials::GetCredentialsProvider(
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider>* result) const {
   result->reset();
 
+  if (provider) {
+      *result = provider;
+      return Status::OK();
+  }
+
   AwsAccessType aws_type = GetAccessType();
   Status status = CheckCredentials(aws_type);
   if (status.ok()) {
@@ -172,8 +168,7 @@ Status AwsCloudAccessCredentials::GetCredentialsProvider(
 //
 AwsEnv::AwsEnv(Env* underlying_env, const CloudEnvOptions& _cloud_env_options,
                const std::shared_ptr<Logger>& info_log)
-    : CloudEnvImpl(_cloud_env_options, underlying_env, info_log),
-      rng_(time(nullptr)) {
+    : CloudEnvImpl(_cloud_env_options, underlying_env, info_log) {
   Aws::InitAPI(Aws::SDKOptions());
   if (cloud_env_options.src_bucket.GetRegion().empty() ||
       cloud_env_options.dest_bucket.GetRegion().empty()) {
@@ -194,126 +189,6 @@ AwsEnv::AwsEnv(Env* underlying_env, const CloudEnvOptions& _cloud_env_options,
 
 void AwsEnv::Shutdown() { Aws::ShutdownAPI(Aws::SDKOptions()); }
 
-//
-// All db in a bucket are stored in path /.rockset/dbid/<dbid>
-// The value of the object is the pathname where the db resides.
-//
-Status AwsEnv::SaveDbid(const std::string& bucket_name, const std::string& dbid,
-                        const std::string& dirname) {
-  Log(InfoLogLevel::DEBUG_LEVEL, info_log_, "[s3] SaveDbid dbid %s dir '%s'",
-      dbid.c_str(), dirname.c_str());
-
-  std::string dbidkey = dbid_registry_ + dbid;
-  std::unordered_map<std::string, std::string> metadata;
-  metadata["dirname"] = dirname;
-
-  Status st = cloud_env_options.storage_provider->PutCloudObjectMetadata(
-      bucket_name, dbidkey, metadata);
-
-  if (!st.ok()) {
-    Log(InfoLogLevel::ERROR_LEVEL, info_log_,
-        "[aws] Bucket %s SaveDbid error in saving dbid %s dirname %s %s",
-        bucket_name.c_str(), dbid.c_str(), dirname.c_str(),
-        st.ToString().c_str());
-  } else {
-    Log(InfoLogLevel::INFO_LEVEL, info_log_,
-        "[aws] Bucket %s SaveDbid dbid %s dirname %s %s", bucket_name.c_str(),
-        dbid.c_str(), dirname.c_str(), "ok");
-  }
-  return st;
-};
-
-//
-// Given a dbid, retrieves its pathname.
-//
-Status AwsEnv::GetPathForDbid(const std::string& bucket,
-                              const std::string& dbid, std::string* dirname) {
-  std::string dbidkey = dbid_registry_ + dbid;
-
-  Log(InfoLogLevel::DEBUG_LEVEL, info_log_,
-      "[s3] Bucket %s GetPathForDbid dbid %s", bucket.c_str(), dbid.c_str());
-
-  CloudObjectInformation info;
-  Status st = cloud_env_options.storage_provider->GetCloudObjectMetadata(
-      bucket, dbidkey, &info);
-  if (!st.ok()) {
-    if (st.IsNotFound()) {
-      Log(InfoLogLevel::ERROR_LEVEL, info_log_,
-          "[aws] %s GetPathForDbid error non-existent dbid %s %s",
-          bucket.c_str(), dbid.c_str(), st.ToString().c_str());
-    } else {
-      Log(InfoLogLevel::ERROR_LEVEL, info_log_,
-          "[aws] %s GetPathForDbid error dbid %s %s", bucket.c_str(),
-          dbid.c_str(), st.ToString().c_str());
-    }
-    return st;
-  }
-
-  // Find "dirname" metadata that stores the pathname of the db
-  const char* kDirnameTag = "dirname";
-  auto it = info.metadata.find(kDirnameTag);
-  if (it != info.metadata.end()) {
-    *dirname = it->second;
-  } else {
-    st = Status::NotFound("GetPathForDbid");
-  }
-  Log(InfoLogLevel::INFO_LEVEL, info_log_, "[aws] %s GetPathForDbid dbid %s %s",
-      bucket.c_str(), dbid.c_str(), st.ToString().c_str());
-  return st;
-}
-
-//
-// Retrieves the list of all registered dbids and their paths
-//
-Status AwsEnv::GetDbidList(const std::string& bucket, DbidList* dblist) {
-  // fetch the list all all dbids
-  std::vector<std::string> dbid_list;
-  Status st = cloud_env_options.storage_provider->ListCloudObjects(
-      bucket, dbid_registry_, &dbid_list);
-  if (!st.ok()) {
-    Log(InfoLogLevel::ERROR_LEVEL, info_log_,
-        "[aws] %s GetDbidList error in GetChildrenFromS3 %s", bucket.c_str(),
-        st.ToString().c_str());
-    return st;
-  }
-  // for each dbid, fetch the db directory where the db data should reside
-  for (auto dbid : dbid_list) {
-    std::string dirname;
-    st = GetPathForDbid(bucket, dbid, &dirname);
-    if (!st.ok()) {
-      Log(InfoLogLevel::ERROR_LEVEL, info_log_,
-          "[aws] %s GetDbidList error in GetPathForDbid(%s) %s", bucket.c_str(),
-          dbid.c_str(), st.ToString().c_str());
-      return st;
-    }
-    // insert item into result set
-    (*dblist)[dbid] = dirname;
-  }
-  return st;
-}
-
-//
-// Deletes the specified dbid from the registry
-//
-Status AwsEnv::DeleteDbid(const std::string& bucket, const std::string& dbid) {
-  // fetch the list all all dbids
-  std::string dbidkey = dbid_registry_ + dbid;
-  Status st =
-      cloud_env_options.storage_provider->DeleteCloudObject(bucket, dbidkey);
-  Log(InfoLogLevel::DEBUG_LEVEL, info_log_,
-      "[aws] %s DeleteDbid DeleteDbid(%s) %s", bucket.c_str(), dbid.c_str(),
-      st.ToString().c_str());
-  return st;
-}
-
-Status AwsEnv::LockFile(const std::string& /*fname*/, FileLock** lock) {
-  // there isn's a very good way to atomically check and create
-  // a file via libs3
-  *lock = nullptr;
-  return Status::OK();
-}
-
-Status AwsEnv::UnlockFile(FileLock* /*lock*/) { return Status::OK(); }
 
 // The factory method for creating an S3 Env
 Status AwsEnv::NewAwsEnv(Env* base_env, const CloudEnvOptions& cloud_options,
@@ -328,8 +203,16 @@ Status AwsEnv::NewAwsEnv(Env* base_env, const CloudEnvOptions& cloud_options,
   // These lines of code are likely temporary until the new configuration stuff
   // comes into play.
   CloudEnvOptions options = cloud_options;  // Make a copy
-  status =
+
+  // If the user has not specified a storage provider, then use the default
+  // provider for this CloudType
+  if (!options.storage_provider) {
+    status =
       CloudStorageProviderImpl::CreateS3Provider(&options.storage_provider);
+    Log(InfoLogLevel::ERROR_LEVEL, info_log,
+        "[aws] NewAwsEnv Created default S3 storage provider for cloud type %d. %s",
+	cloud_options.cloud_type, status.ToString().c_str());
+  }
   if (status.ok() && !cloud_options.keep_local_log_files) {
     if (cloud_options.log_type == kLogKinesis) {
       status = CloudLogControllerImpl::CreateKinesisController(
@@ -358,10 +241,6 @@ Status AwsEnv::NewAwsEnv(Env* base_env, const CloudEnvOptions& cloud_options,
   }
   return status;
 }
-
-std::string AwsEnv::GetWALCacheDir() {
-  return cloud_env_options.cloud_log_controller->GetCacheDir();
-}
-
 #endif  // USE_AWS
 }  // namespace ROCKSDB_NAMESPACE
+#endif // ROCKSDB_LITE
