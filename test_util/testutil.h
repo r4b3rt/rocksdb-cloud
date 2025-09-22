@@ -25,8 +25,18 @@
 #include "table/internal_iterator.h"
 #include "util/mutexlock.h"
 
+#ifdef ROCKSDB_UNITTESTS_WITH_CUSTOM_OBJECTS_FROM_STATIC_LIBS
+extern "C" {
+void RegisterCustomObjects(int argc, char** argv);
+}
+#else
+void RegisterCustomObjects(int argc, char** argv);
+#endif  // !ROCKSDB_UNITTESTS_WITH_CUSTOM_OBJECTS_FROM_STATIC_LIBS
+
 namespace ROCKSDB_NAMESPACE {
 class FileSystem;
+class MemTableRepFactory;
+class ObjectLibrary;
 class Random;
 class SequentialFile;
 class SequentialFileReader;
@@ -34,42 +44,35 @@ class SequentialFileReader;
 namespace test {
 
 extern const uint32_t kDefaultFormatVersion;
-extern const uint32_t kLatestFormatVersion;
+extern const std::set<uint32_t> kFooterFormatVersionsToTest;
 
 // Return a random key with the specified length that may contain interesting
 // characters (e.g. \x00, \xff, etc.).
 enum RandomKeyType : char { RANDOM, LARGEST, SMALLEST, MIDDLE };
-extern std::string RandomKey(Random* rnd, int len,
-                             RandomKeyType type = RandomKeyType::RANDOM);
+std::string RandomKey(Random* rnd, int len,
+                      RandomKeyType type = RandomKeyType::RANDOM);
+
+enum class UserDefinedTimestampTestMode {
+  // Test does not enable user-defined timestamp feature.
+  kNone,
+  // Test enables user-defined timestamp feature. Write/read with min timestamps
+  kNormal,
+  // Test enables user-defined timestamp feature. Write/read with min timestamps
+  // Set `persist_user_defined_timestamps` to false.
+  kStripUserDefinedTimestamp,
+};
+
+const std::vector<UserDefinedTimestampTestMode>& GetUDTTestModes();
+
+bool IsUDTEnabled(const UserDefinedTimestampTestMode& test_mode);
+
+bool ShouldPersistUDT(const UserDefinedTimestampTestMode& test_mode);
 
 // Store in *dst a string of length "len" that will compress to
 // "N*compressed_fraction" bytes and return a Slice that references
 // the generated data.
-extern Slice CompressibleString(Random* rnd, double compressed_fraction,
-                                int len, std::string* dst);
-
-// A wrapper that allows injection of errors.
-class ErrorEnv : public EnvWrapper {
- public:
-  bool writable_file_error_;
-  int num_writable_file_errors_;
-
-  ErrorEnv(Env* _target)
-      : EnvWrapper(_target),
-        writable_file_error_(false),
-        num_writable_file_errors_(0) {}
-
-  virtual Status NewWritableFile(const std::string& fname,
-                                 std::unique_ptr<WritableFile>* result,
-                                 const EnvOptions& soptions) override {
-    result->reset();
-    if (writable_file_error_) {
-      ++num_writable_file_errors_;
-      return Status::IOError(fname, "fake error");
-    }
-    return target()->NewWritableFile(fname, result, soptions);
-  }
-};
+Slice CompressibleString(Random* rnd, double compressed_fraction, int len,
+                         std::string* dst);
 
 #ifndef NDEBUG
 // An internal comparator that just forward comparing results from the
@@ -83,7 +86,7 @@ class PlainInternalKeyComparator : public InternalKeyComparator {
 
   virtual ~PlainInternalKeyComparator() {}
 
-  virtual int Compare(const Slice& a, const Slice& b) const override {
+  int Compare(const Slice& a, const Slice& b) const override {
     return user_comparator()->Compare(a, b);
   }
 };
@@ -98,12 +101,10 @@ class PlainInternalKeyComparator : public InternalKeyComparator {
 class SimpleSuffixReverseComparator : public Comparator {
  public:
   SimpleSuffixReverseComparator() {}
+  static const char* kClassName() { return "SimpleSuffixReverseComparator"; }
+  const char* Name() const override { return kClassName(); }
 
-  virtual const char* Name() const override {
-    return "SimpleSuffixReverseComparator";
-  }
-
-  virtual int Compare(const Slice& a, const Slice& b) const override {
+  int Compare(const Slice& a, const Slice& b) const override {
     Slice prefix_a = Slice(a.data(), 8);
     Slice prefix_b = Slice(b.data(), 8);
     int prefix_comp = prefix_a.compare(prefix_b);
@@ -115,10 +116,10 @@ class SimpleSuffixReverseComparator : public Comparator {
       return -(suffix_a.compare(suffix_b));
     }
   }
-  virtual void FindShortestSeparator(std::string* /*start*/,
-                                     const Slice& /*limit*/) const override {}
+  void FindShortestSeparator(std::string* /*start*/,
+                             const Slice& /*limit*/) const override {}
 
-  virtual void FindShortSuccessor(std::string* /*key*/) const override {}
+  void FindShortSuccessor(std::string* /*key*/) const override {}
 };
 
 // Returns a user key comparator that can be used for comparing two uint64_t
@@ -126,59 +127,13 @@ class SimpleSuffixReverseComparator : public Comparator {
 // at once. Assumes same endian-ness is used though the database's lifetime.
 // Symantics of comparison would differ from Bytewise comparator in little
 // endian machines.
-extern const Comparator* Uint64Comparator();
+const Comparator* Uint64Comparator();
 
-// Iterator over a vector of keys/values
-class VectorIterator : public InternalIterator {
- public:
-  explicit VectorIterator(const std::vector<std::string>& keys)
-      : keys_(keys), current_(keys.size()) {
-    std::sort(keys_.begin(), keys_.end());
-    values_.resize(keys.size());
-  }
+// A wrapper api for getting the ComparatorWithU64Ts<BytewiseComparator>
+const Comparator* BytewiseComparatorWithU64TsWrapper();
 
-  VectorIterator(const std::vector<std::string>& keys,
-      const std::vector<std::string>& values)
-    : keys_(keys), values_(values), current_(keys.size()) {
-    assert(keys_.size() == values_.size());
-  }
-
-  virtual bool Valid() const override { return current_ < keys_.size(); }
-
-  virtual void SeekToFirst() override { current_ = 0; }
-  virtual void SeekToLast() override { current_ = keys_.size() - 1; }
-
-  virtual void Seek(const Slice& target) override {
-    current_ = std::lower_bound(keys_.begin(), keys_.end(), target.ToString()) -
-               keys_.begin();
-  }
-
-  virtual void SeekForPrev(const Slice& target) override {
-    current_ = std::upper_bound(keys_.begin(), keys_.end(), target.ToString()) -
-               keys_.begin();
-    if (!Valid()) {
-      SeekToLast();
-    } else {
-      Prev();
-    }
-  }
-
-  virtual void Next() override { current_++; }
-  virtual void Prev() override { current_--; }
-
-  virtual Slice key() const override { return Slice(keys_[current_]); }
-  virtual Slice value() const override { return Slice(values_[current_]); }
-
-  virtual Status status() const override { return Status::OK(); }
-
-  virtual bool IsKeyPinned() const override { return true; }
-  virtual bool IsValuePinned() const override { return true; }
-
- private:
-  std::vector<std::string> keys_;
-  std::vector<std::string> values_;
-  size_t current_;
-};
+// A wrapper api for getting the ComparatorWithU64Ts<ReverseBytewiseComparator>
+const Comparator* ReverseBytewiseComparatorWithU64TsWrapper();
 
 class StringSink : public FSWritableFile {
  public:
@@ -208,9 +163,8 @@ class StringSink : public FSWritableFile {
     if (reader_contents_ != nullptr) {
       assert(reader_contents_->size() <= last_flush_);
       size_t offset = last_flush_ - reader_contents_->size();
-      *reader_contents_ = Slice(
-          contents_.data() + offset,
-          contents_.size() - offset);
+      *reader_contents_ =
+          Slice(contents_.data() + offset, contents_.size() - offset);
       last_flush_ = contents_.size();
     }
 
@@ -229,10 +183,15 @@ class StringSink : public FSWritableFile {
   void Drop(size_t bytes) {
     if (reader_contents_ != nullptr) {
       contents_.resize(contents_.size() - bytes);
-      *reader_contents_ = Slice(
-          reader_contents_->data(), reader_contents_->size() - bytes);
+      *reader_contents_ =
+          Slice(reader_contents_->data(), reader_contents_->size() - bytes);
       last_flush_ = contents_.size();
     }
+  }
+
+  uint64_t GetFileSize(const IOOptions& /*options*/,
+                       IODebugContext* /*dbg*/) override {
+    return contents_.size();
   }
 
  private:
@@ -331,6 +290,11 @@ class OverwritingStringSink : public FSWritableFile {
     if (last_flush_ > contents_.size()) last_flush_ = contents_.size();
   }
 
+  uint64_t GetFileSize(const IOOptions& /*options*/,
+                       IODebugContext* /*dbg*/) override {
+    return contents_.size();
+  }
+
  private:
   std::string contents_;
   Slice* reader_contents_;
@@ -346,7 +310,7 @@ class StringSource : public FSRandomAccessFile {
         mmap_(mmap),
         total_reads_(0) {}
 
-  virtual ~StringSource() { }
+  virtual ~StringSource() {}
 
   uint64_t Size() const { return contents_.size(); }
 
@@ -388,7 +352,7 @@ class StringSource : public FSRandomAccessFile {
     char* rid = id;
     rid = EncodeVarint64(rid, uniq_id_);
     rid = EncodeVarint64(rid, 0);
-    return static_cast<size_t>(rid-id);
+    return static_cast<size_t>(rid - id);
   }
 
   int total_reads() const { return total_reads_; }
@@ -405,20 +369,19 @@ class StringSource : public FSRandomAccessFile {
 class NullLogger : public Logger {
  public:
   using Logger::Logv;
-  virtual void Logv(const char* /*format*/, va_list /*ap*/) override {}
-  virtual size_t GetLogFileSize() const override { return 0; }
+  void Logv(const char* /*format*/, va_list /*ap*/) override {}
+  size_t GetLogFileSize() const override { return 0; }
 };
 
 // Corrupts key by changing the type
-extern void CorruptKeyType(InternalKey* ikey);
+void CorruptKeyType(InternalKey* ikey);
 
-extern std::string KeyStr(const std::string& user_key,
-                          const SequenceNumber& seq, const ValueType& t,
-                          bool corrupt = false);
+std::string KeyStr(const std::string& user_key, const SequenceNumber& seq,
+                   const ValueType& t, bool corrupt = false);
 
-extern std::string KeyStr(uint64_t ts, const std::string& user_key,
-                          const SequenceNumber& seq, const ValueType& t,
-                          bool corrupt = false);
+std::string KeyStr(uint64_t ts, const std::string& user_key,
+                   const SequenceNumber& seq, const ValueType& t,
+                   bool corrupt = false);
 
 class SleepingBackgroundTask {
  public:
@@ -427,6 +390,16 @@ class SleepingBackgroundTask {
         should_sleep_(true),
         done_with_sleep_(false),
         sleeping_(false) {}
+
+  ~SleepingBackgroundTask() {
+    MutexLock l(&mutex_);
+    should_sleep_ = false;
+    while (sleeping_) {
+      assert(!should_sleep_);
+      bg_cv_.SignalAll();
+      bg_cv_.Wait();
+    }
+  }
 
   bool IsSleeping() {
     MutexLock l(&mutex_);
@@ -482,7 +455,7 @@ class SleepingBackgroundTask {
   }
 
   static void DoSleepTask(void* arg) {
-    reinterpret_cast<SleepingBackgroundTask*>(arg)->DoSleep();
+    static_cast<SleepingBackgroundTask*>(arg)->DoSleep();
   }
 
  private:
@@ -599,6 +572,14 @@ class StringFS : public FileSystemWrapper {
       return IOStatus::OK();
     }
 
+    uint64_t GetFileSize(const IOOptions& /*options*/,
+                         IODebugContext* /*dbg*/) override {
+      if (contents_ != nullptr) {
+        return contents_->size();
+      }
+      return 0;
+    }
+
    private:
     std::string* contents_;
   };
@@ -606,6 +587,9 @@ class StringFS : public FileSystemWrapper {
   explicit StringFS(const std::shared_ptr<FileSystem>& t)
       : FileSystemWrapper(t) {}
   ~StringFS() override {}
+
+  static const char* kClassName() { return "StringFS"; }
+  const char* Name() const override { return kClassName(); }
 
   const std::string& GetContent(const std::string& f) { return files_[f]; }
 
@@ -764,17 +748,28 @@ class ChanglingMergeOperator : public MergeOperator {
 
   void SetName(const std::string& name) { name_ = name; }
 
-  virtual bool FullMergeV2(const MergeOperationInput& /*merge_in*/,
-                           MergeOperationOutput* /*merge_out*/) const override {
+  bool FullMergeV2(const MergeOperationInput& /*merge_in*/,
+                   MergeOperationOutput* /*merge_out*/) const override {
     return false;
   }
-  virtual bool PartialMergeMulti(const Slice& /*key*/,
-                                 const std::deque<Slice>& /*operand_list*/,
-                                 std::string* /*new_value*/,
-                                 Logger* /*logger*/) const override {
+  bool PartialMergeMulti(const Slice& /*key*/,
+                         const std::deque<Slice>& /*operand_list*/,
+                         std::string* /*new_value*/,
+                         Logger* /*logger*/) const override {
     return false;
   }
-  virtual const char* Name() const override { return name_.c_str(); }
+  static const char* kClassName() { return "ChanglingMergeOperator"; }
+  const char* NickName() const override { return kNickName(); }
+  static const char* kNickName() { return "Changling"; }
+  bool IsInstanceOf(const std::string& id) const override {
+    if (id == kClassName()) {
+      return true;
+    } else {
+      return MergeOperator::IsInstanceOf(id);
+    }
+  }
+
+  const char* Name() const override { return name_.c_str(); }
 
  protected:
   std::string name_;
@@ -796,6 +791,18 @@ class ChanglingCompactionFilter : public CompactionFilter {
               const Slice& /*existing_value*/, std::string* /*new_value*/,
               bool* /*value_changed*/) const override {
     return false;
+  }
+
+  static const char* kClassName() { return "ChanglingCompactionFilter"; }
+  const char* NickName() const override { return kNickName(); }
+  static const char* kNickName() { return "Changling"; }
+
+  bool IsInstanceOf(const std::string& id) const override {
+    if (id == kClassName()) {
+      return true;
+    } else {
+      return CompactionFilter::IsInstanceOf(id);
+    }
   }
 
   const char* Name() const override { return name_.c_str(); }
@@ -823,12 +830,25 @@ class ChanglingCompactionFilterFactory : public CompactionFilterFactory {
 
   // Returns a name that identifies this compaction filter factory.
   const char* Name() const override { return name_.c_str(); }
+  static const char* kClassName() { return "ChanglingCompactionFilterFactory"; }
+  const char* NickName() const override { return kNickName(); }
+  static const char* kNickName() { return "Changling"; }
+
+  bool IsInstanceOf(const std::string& id) const override {
+    if (id == kClassName()) {
+      return true;
+    } else {
+      return CompactionFilterFactory::IsInstanceOf(id);
+    }
+  }
 
  protected:
   std::string name_;
 };
 
-extern const Comparator* ComparatorWithU64Ts();
+// The factory for the hacky skip list mem table that triggers flush after
+// number of entries exceeds a threshold.
+MemTableRepFactory* NewSpecialSkipListFactory(int num_entries_per_flush);
 
 CompressionType RandomCompressionType(Random* rnd);
 
@@ -852,11 +872,6 @@ bool IsPrefetchSupported(const std::shared_ptr<FileSystem>& fs,
 // Return the number of lines where a given pattern was found in a file.
 size_t GetLinesCount(const std::string& fname, const std::string& pattern);
 
-// TEST_TMPDIR may be set to /dev/shm in Makefile,
-// but /dev/shm does not support direct IO.
-// Tries to set TEST_TMPDIR to a directory supporting direct IO.
-void ResetTmpDirForDirectIO();
-
 Status CorruptFile(Env* env, const std::string& fname, int offset,
                    int bytes_to_corrupt, bool verify_checksum = true);
 Status TruncateFile(Env* env, const std::string& fname, uint64_t length);
@@ -871,5 +886,11 @@ void DeleteDir(Env* env, const std::string& dirname);
 // environment variables.
 Status CreateEnvFromSystem(const ConfigOptions& options, Env** result,
                            std::shared_ptr<Env>* guard);
+
+// Registers the testutil classes with the ObjectLibrary
+int RegisterTestObjects(ObjectLibrary& library, const std::string& /*arg*/);
+
+// Register the testutil classes with the default ObjectRegistry/Library
+void RegisterTestLibrary(const std::string& arg = "");
 }  // namespace test
 }  // namespace ROCKSDB_NAMESPACE

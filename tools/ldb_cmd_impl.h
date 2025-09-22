@@ -5,12 +5,12 @@
 
 #pragma once
 
-#include "rocksdb/utilities/ldb_cmd.h"
-
 #include <map>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "rocksdb/utilities/ldb_cmd.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -24,7 +24,7 @@ class CompactorCommand : public LDBCommand {
 
   static void Help(std::string& ret);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
  private:
   bool null_from_;
@@ -43,7 +43,30 @@ class DBFileDumperCommand : public LDBCommand {
 
   static void Help(std::string& ret);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
+
+ private:
+  bool decode_blob_index_;
+  bool dump_uncompressed_blobs_;
+};
+
+class DBLiveFilesMetadataDumperCommand : public LDBCommand {
+ public:
+  static std::string Name() { return "list_live_files_metadata"; }
+
+  DBLiveFilesMetadataDumperCommand(
+      const std::vector<std::string>& params,
+      const std::map<std::string, std::string>& options,
+      const std::vector<std::string>& flags);
+
+  static void Help(std::string& ret);
+
+  void DoCommand() override;
+
+ private:
+  bool sort_by_filename_;
+
+  static const std::string ARG_SORT_BY_FILENAME;
 };
 
 class DBDumperCommand : public LDBCommand {
@@ -56,13 +79,13 @@ class DBDumperCommand : public LDBCommand {
 
   static void Help(std::string& ret);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
  private:
   /**
    * Extract file name from the full path. We handle both the forward slash (/)
    * and backslash (\) to make sure that different OS-s are supported.
-  */
+   */
   static std::string GetFileNameFromPath(const std::string& s) {
     std::size_t n = s.find_last_of("/\\");
 
@@ -85,6 +108,8 @@ class DBDumperCommand : public LDBCommand {
   bool count_delim_;
   bool print_stats_;
   std::string path_;
+  bool decode_blob_index_;
+  bool dump_uncompressed_blobs_;
 
   static const std::string ARG_COUNT_ONLY;
   static const std::string ARG_COUNT_DELIM;
@@ -102,7 +127,7 @@ class InternalDumpCommand : public LDBCommand {
 
   static void Help(std::string& ret);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
  private:
   bool has_from_;
@@ -115,6 +140,7 @@ class InternalDumpCommand : public LDBCommand {
   bool count_delim_;
   bool print_stats_;
   bool is_input_key_hex_;
+  bool decode_blob_index_;
 
   static const std::string ARG_DELIM;
   static const std::string ARG_COUNT_ONLY;
@@ -134,9 +160,10 @@ class DBLoaderCommand : public LDBCommand {
                   const std::vector<std::string>& flags);
 
   static void Help(std::string& ret);
-  virtual void DoCommand() override;
 
-  virtual void OverrideBaseOptions() override;
+  void DoCommand() override;
+
+  void OverrideBaseOptions() override;
 
  private:
   bool disable_wal_;
@@ -157,9 +184,10 @@ class ManifestDumpCommand : public LDBCommand {
                       const std::vector<std::string>& flags);
 
   static void Help(std::string& ret);
-  virtual void DoCommand() override;
 
-  virtual bool NoDBOpen() override { return true; }
+  void DoCommand() override;
+
+  bool NoDBOpen() override { return true; }
 
  private:
   bool verbose_;
@@ -169,6 +197,28 @@ class ManifestDumpCommand : public LDBCommand {
   static const std::string ARG_VERBOSE;
   static const std::string ARG_JSON;
   static const std::string ARG_PATH;
+};
+
+class UpdateManifestCommand : public LDBCommand {
+ public:
+  static std::string Name() { return "update_manifest"; }
+
+  UpdateManifestCommand(const std::vector<std::string>& params,
+                        const std::map<std::string, std::string>& options,
+                        const std::vector<std::string>& flags);
+
+  static void Help(std::string& ret);
+  void DoCommand() override;
+
+  bool NoDBOpen() override { return true; }
+
+ private:
+  bool verbose_;
+  bool update_temperatures_;
+  // TODO future: checksum_func for populating checksums
+
+  static const std::string ARG_VERBOSE;
+  static const std::string ARG_UPDATE_TEMPERATURES;
 };
 
 class FileChecksumDumpCommand : public LDBCommand {
@@ -215,9 +265,10 @@ class ListColumnFamiliesCommand : public LDBCommand {
                             const std::vector<std::string>& flags);
 
   static void Help(std::string& ret);
-  virtual void DoCommand() override;
 
-  virtual bool NoDBOpen() override { return true; }
+  void DoCommand() override;
+
+  bool NoDBOpen() override { return true; }
 };
 
 class CreateColumnFamilyCommand : public LDBCommand {
@@ -229,9 +280,10 @@ class CreateColumnFamilyCommand : public LDBCommand {
                             const std::vector<std::string>& flags);
 
   static void Help(std::string& ret);
-  virtual void DoCommand() override;
 
-  virtual bool NoDBOpen() override { return false; }
+  void DoCommand() override;
+
+  bool NoDBOpen() override { return false; }
 
  private:
   std::string new_cf_name_;
@@ -246,9 +298,10 @@ class DropColumnFamilyCommand : public LDBCommand {
                           const std::vector<std::string>& flags);
 
   static void Help(std::string& ret);
-  virtual void DoCommand() override;
 
-  virtual bool NoDBOpen() override { return false; }
+  void DoCommand() override;
+
+  bool NoDBOpen() override { return false; }
 
  private:
   std::string cf_name_to_drop_;
@@ -262,11 +315,11 @@ class ReduceDBLevelsCommand : public LDBCommand {
                         const std::map<std::string, std::string>& options,
                         const std::vector<std::string>& flags);
 
-  virtual void OverrideBaseCFOptions(ColumnFamilyOptions* cf_opts) override;
+  void OverrideBaseCFOptions(ColumnFamilyOptions* cf_opts) override;
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
-  virtual bool NoDBOpen() override { return true; }
+  bool NoDBOpen() override { return true; }
 
   static void Help(std::string& msg);
 
@@ -294,9 +347,9 @@ class ChangeCompactionStyleCommand : public LDBCommand {
       const std::map<std::string, std::string>& options,
       const std::vector<std::string>& flags);
 
-  virtual void OverrideBaseCFOptions(ColumnFamilyOptions* cf_opts) override;
+  void OverrideBaseCFOptions(ColumnFamilyOptions* cf_opts) override;
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
   static void Help(std::string& msg);
 
@@ -316,10 +369,11 @@ class WALDumperCommand : public LDBCommand {
                    const std::map<std::string, std::string>& options,
                    const std::vector<std::string>& flags);
 
-  virtual bool NoDBOpen() override { return true; }
+  bool NoDBOpen() override { return true; }
 
   static void Help(std::string& ret);
-  virtual void DoCommand() override;
+
+  void DoCommand() override;
 
  private:
   bool print_header_;
@@ -341,7 +395,39 @@ class GetCommand : public LDBCommand {
              const std::map<std::string, std::string>& options,
              const std::vector<std::string>& flags);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
+
+  static void Help(std::string& ret);
+
+ private:
+  std::string key_;
+};
+
+class MultiGetCommand : public LDBCommand {
+ public:
+  static std::string Name() { return "multi_get"; }
+
+  MultiGetCommand(const std::vector<std::string>& params,
+                  const std::map<std::string, std::string>& options,
+                  const std::vector<std::string>& flags);
+
+  void DoCommand() override;
+
+  static void Help(std::string& ret);
+
+ private:
+  std::vector<std::string> keys_;
+};
+
+class GetEntityCommand : public LDBCommand {
+ public:
+  static std::string Name() { return "get_entity"; }
+
+  GetEntityCommand(const std::vector<std::string>& params,
+                   const std::map<std::string, std::string>& options,
+                   const std::vector<std::string>& flags);
+
+  void DoCommand() override;
 
   static void Help(std::string& ret);
 
@@ -357,7 +443,7 @@ class ApproxSizeCommand : public LDBCommand {
                     const std::map<std::string, std::string>& options,
                     const std::vector<std::string>& flags);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
   static void Help(std::string& ret);
 
@@ -374,11 +460,11 @@ class BatchPutCommand : public LDBCommand {
                   const std::map<std::string, std::string>& options,
                   const std::vector<std::string>& flags);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
   static void Help(std::string& ret);
 
-  virtual void OverrideBaseOptions() override;
+  void OverrideBaseOptions() override;
 
  private:
   /**
@@ -395,7 +481,7 @@ class ScanCommand : public LDBCommand {
               const std::map<std::string, std::string>& options,
               const std::vector<std::string>& flags);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
   static void Help(std::string& ret);
 
@@ -416,7 +502,23 @@ class DeleteCommand : public LDBCommand {
                 const std::map<std::string, std::string>& options,
                 const std::vector<std::string>& flags);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
+
+  static void Help(std::string& ret);
+
+ private:
+  std::string key_;
+};
+
+class SingleDeleteCommand : public LDBCommand {
+ public:
+  static std::string Name() { return "singledelete"; }
+
+  SingleDeleteCommand(const std::vector<std::string>& params,
+                      const std::map<std::string, std::string>& options,
+                      const std::vector<std::string>& flags);
+
+  void DoCommand() override;
 
   static void Help(std::string& ret);
 
@@ -432,7 +534,7 @@ class DeleteRangeCommand : public LDBCommand {
                      const std::map<std::string, std::string>& options,
                      const std::vector<std::string>& flags);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
   static void Help(std::string& ret);
 
@@ -449,15 +551,35 @@ class PutCommand : public LDBCommand {
              const std::map<std::string, std::string>& options,
              const std::vector<std::string>& flags);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
   static void Help(std::string& ret);
 
-  virtual void OverrideBaseOptions() override;
+  void OverrideBaseOptions() override;
 
  private:
   std::string key_;
   std::string value_;
+};
+
+class PutEntityCommand : public LDBCommand {
+ public:
+  static std::string Name() { return "put_entity"; }
+
+  PutEntityCommand(const std::vector<std::string>& params,
+                   const std::map<std::string, std::string>& options,
+                   const std::vector<std::string>& flags);
+
+  void DoCommand() override;
+
+  static void Help(std::string& ret);
+
+  void OverrideBaseOptions() override;
+
+ private:
+  std::string key_;
+  std::vector<std::string> column_names_;
+  std::vector<std::string> column_values_;
 };
 
 /**
@@ -474,7 +596,7 @@ class DBQuerierCommand : public LDBCommand {
 
   static void Help(std::string& ret);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
  private:
   static const char* HELP_CMD;
@@ -491,9 +613,9 @@ class CheckConsistencyCommand : public LDBCommand {
                           const std::map<std::string, std::string>& options,
                           const std::vector<std::string>& flags);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
-  virtual bool NoDBOpen() override { return true; }
+  bool NoDBOpen() override { return true; }
 
   static void Help(std::string& ret);
 };
@@ -503,14 +625,15 @@ class CheckPointCommand : public LDBCommand {
   static std::string Name() { return "checkpoint"; }
 
   CheckPointCommand(const std::vector<std::string>& params,
-                const std::map<std::string, std::string>& options,
-                const std::vector<std::string>& flags);
+                    const std::map<std::string, std::string>& options,
+                    const std::vector<std::string>& flags);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
   static void Help(std::string& ret);
 
   std::string checkpoint_dir_;
+
  private:
   static const std::string ARG_CHECKPOINT_DIR;
 };
@@ -523,20 +646,26 @@ class RepairCommand : public LDBCommand {
                 const std::map<std::string, std::string>& options,
                 const std::vector<std::string>& flags);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
-  virtual bool NoDBOpen() override { return true; }
+  bool NoDBOpen() override { return true; }
 
-  virtual void OverrideBaseOptions() override;
+  void OverrideBaseOptions() override;
 
   static void Help(std::string& ret);
+
+ protected:
+  bool verbose_;
+
+ private:
+  static const std::string ARG_VERBOSE;
 };
 
-class BackupableCommand : public LDBCommand {
+class BackupEngineCommand : public LDBCommand {
  public:
-  BackupableCommand(const std::vector<std::string>& params,
-                    const std::map<std::string, std::string>& options,
-                    const std::vector<std::string>& flags);
+  BackupEngineCommand(const std::vector<std::string>& params,
+                      const std::map<std::string, std::string>& options,
+                      const std::vector<std::string>& flags);
 
  protected:
   static void Help(const std::string& name, std::string& ret);
@@ -555,24 +684,24 @@ class BackupableCommand : public LDBCommand {
   static const std::string ARG_STDERR_LOG_LEVEL;
 };
 
-class BackupCommand : public BackupableCommand {
+class BackupCommand : public BackupEngineCommand {
  public:
   static std::string Name() { return "backup"; }
   BackupCommand(const std::vector<std::string>& params,
                 const std::map<std::string, std::string>& options,
                 const std::vector<std::string>& flags);
-  virtual void DoCommand() override;
+  void DoCommand() override;
   static void Help(std::string& ret);
 };
 
-class RestoreCommand : public BackupableCommand {
+class RestoreCommand : public BackupEngineCommand {
  public:
   static std::string Name() { return "restore"; }
   RestoreCommand(const std::vector<std::string>& params,
                  const std::map<std::string, std::string>& options,
                  const std::vector<std::string>& flags);
-  virtual void DoCommand() override;
-  virtual bool NoDBOpen() override { return true; }
+  void DoCommand() override;
+  bool NoDBOpen() override { return true; }
   static void Help(std::string& ret);
 };
 
@@ -584,11 +713,11 @@ class WriteExternalSstFilesCommand : public LDBCommand {
       const std::map<std::string, std::string>& options,
       const std::vector<std::string>& flags);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
-  virtual bool NoDBOpen() override { return false; }
+  bool NoDBOpen() override { return false; }
 
-  virtual void OverrideBaseOptions() override;
+  void OverrideBaseOptions() override;
 
   static void Help(std::string& ret);
 
@@ -604,11 +733,11 @@ class IngestExternalSstFilesCommand : public LDBCommand {
       const std::map<std::string, std::string>& options,
       const std::vector<std::string>& flags);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
-  virtual bool NoDBOpen() override { return false; }
+  bool NoDBOpen() override { return false; }
 
-  virtual void OverrideBaseOptions() override;
+  void OverrideBaseOptions() override;
 
   static void Help(std::string& ret);
 
@@ -656,12 +785,34 @@ class UnsafeRemoveSstFileCommand : public LDBCommand {
 
   static void Help(std::string& ret);
 
-  virtual void DoCommand() override;
+  void DoCommand() override;
 
-  virtual bool NoDBOpen() override { return true; }
+  bool NoDBOpen() override { return true; }
 
  private:
   uint64_t sst_file_number_;
+};
+
+// A command to dump cloud manifest
+class CloudManifestDumpCommand : public LDBCommand {
+  public:
+   static std::string Name() { return "cloud_manifest_dump"; }
+
+   CloudManifestDumpCommand(const std::vector<std::string>& params,
+                            const std::map<std::string, std::string>& options,
+                            const std::vector<std::string>& flags);
+   static void Help(std::string& ret);
+
+   virtual void DoCommand() override;
+
+   virtual bool NoDBOpen() override { return true; }
+  private:
+   // If true, will print past epochs as well
+   bool verbose_{false};
+   std::string path_;
+
+   static const std::string ARG_PATH;
+   static const std::string ARG_VERBOSE;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

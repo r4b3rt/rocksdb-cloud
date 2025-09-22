@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#ifndef ROCKSDB_LITE
 
 #include "rocksdb/sst_file_reader.h"
 
@@ -37,7 +36,7 @@ struct SstFileReader::Rep {
 
 SstFileReader::SstFileReader(const Options& options) : rep_(new Rep(options)) {}
 
-SstFileReader::~SstFileReader() {}
+SstFileReader::~SstFileReader() = default;
 
 Status SstFileReader::Open(const std::string& file_path) {
   auto r = rep_.get();
@@ -56,8 +55,17 @@ Status SstFileReader::Open(const std::string& file_path) {
     file_reader.reset(new RandomAccessFileReader(std::move(file), file_path));
   }
   if (s.ok()) {
-    TableReaderOptions t_opt(r->ioptions, r->moptions.prefix_extractor.get(),
-                             r->soptions, r->ioptions.internal_comparator);
+    TableReaderOptions t_opt(
+        r->ioptions, r->moptions.prefix_extractor, r->soptions,
+        r->ioptions.internal_comparator,
+        r->moptions.block_protection_bytes_per_key,
+        /*skip_filters*/ false, /*immortal*/ false,
+        /*force_direct_prefetch*/ false, /*level*/ -1,
+        /*block_cache_tracer*/ nullptr,
+        /*max_file_size_for_l0_meta_pin*/ 0, /*cur_db_session_id*/ "",
+        /*cur_file_num*/ 0,
+        /* unique_id */ {}, /* largest_seqno */ 0,
+        /* tail_size */ 0, r->ioptions.persist_user_defined_timestamps);
     // Allow open file with global sequence number for backward compatibility.
     t_opt.largest_seqno = kMaxSequenceNumber;
     s = r->options.table_factory->NewTableReader(t_opt, std::move(file_reader),
@@ -67,17 +75,17 @@ Status SstFileReader::Open(const std::string& file_path) {
 }
 
 Iterator* SstFileReader::NewIterator(const ReadOptions& roptions) {
+  assert(roptions.io_activity == Env::IOActivity::kUnknown);
   auto r = rep_.get();
   auto sequence = roptions.snapshot != nullptr
                       ? roptions.snapshot->GetSequenceNumber()
                       : kMaxSequenceNumber;
   ArenaWrappedDBIter* res = new ArenaWrappedDBIter();
-  res->Init(r->options.env, roptions, r->ioptions, r->moptions,
-            nullptr /* version */, sequence,
-            r->moptions.max_sequential_skip_in_iterations,
-            0 /* version_number */, nullptr /* read_callback */,
-            nullptr /* db_impl */, nullptr /* cfd */,
-            true /* expose_blob_index */, false /* allow_refresh */);
+  res->Init(
+      r->options.env, roptions, r->ioptions, r->moptions, nullptr /* version */,
+      sequence, r->moptions.max_sequential_skip_in_iterations,
+      0 /* version_number */, nullptr /* read_callback */, nullptr /* cfh */,
+      true /* expose_blob_index */, false /* allow_refresh */);
   auto internal_iter = r->table_reader->NewIterator(
       res->GetReadOptions(), r->moptions.prefix_extractor.get(),
       res->GetArena(), false /* skip_filters */,
@@ -92,10 +100,45 @@ std::shared_ptr<const TableProperties> SstFileReader::GetTableProperties()
 }
 
 Status SstFileReader::VerifyChecksum(const ReadOptions& read_options) {
+  assert(read_options.io_activity == Env::IOActivity::kUnknown);
   return rep_->table_reader->VerifyChecksum(read_options,
                                             TableReaderCaller::kSSTFileReader);
 }
 
-}  // namespace ROCKSDB_NAMESPACE
+Status SstFileReader::VerifyNumEntries(const ReadOptions& read_options) {
+  Rep* r = rep_.get();
+  std::unique_ptr<InternalIterator> internal_iter{r->table_reader->NewIterator(
+      read_options, r->moptions.prefix_extractor.get(), nullptr,
+      false /* skip_filters */, TableReaderCaller::kSSTFileReader)};
+  internal_iter->SeekToFirst();
+  Status s = internal_iter->status();
+  if (!s.ok()) {
+    return s;
+  }
+  uint64_t num_read = 0;
+  for (; internal_iter->Valid(); internal_iter->Next()) {
+    ++num_read;
+  };
+  s = internal_iter->status();
+  if (!s.ok()) {
+    return s;
+  }
+  std::shared_ptr<const TableProperties> tp = GetTableProperties();
+  if (!tp) {
+    s = Status::Corruption("table properties not available");
+  } else {
+    // TODO: verify num_range_deletions
+    uint64_t expected = tp->num_entries - tp->num_range_deletions;
+    if (num_read != expected) {
+      std::ostringstream oss;
+      oss << "Table property expects " << expected
+          << " entries when excluding range deletions,"
+          << " but scanning the table returned " << std::to_string(num_read)
+          << " entries";
+      s = Status::Corruption(oss.str());
+    }
+  }
+  return s;
+}
 
-#endif  // !ROCKSDB_LITE
+}  // namespace ROCKSDB_NAMESPACE

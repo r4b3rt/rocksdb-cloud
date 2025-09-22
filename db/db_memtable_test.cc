@@ -17,7 +17,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class DBMemTableTest : public DBTestBase {
  public:
-  DBMemTableTest() : DBTestBase("/db_memtable_test", /*env_do_fsync=*/true) {}
+  DBMemTableTest() : DBTestBase("db_memtable_test", /*env_do_fsync=*/true) {}
 };
 
 class MockMemTableRep : public MemTableRep {
@@ -97,7 +97,7 @@ class MockMemTableRepFactory : public MemTableRepFactory {
 
  private:
   MockMemTableRep* mock_rep_;
-  // workaround since there's no port::kMaxUint32 yet.
+  // workaround since there's no std::numeric_limits<uint32_t>::max() yet.
   uint32_t last_column_family_id_ = static_cast<uint32_t>(-1);
 };
 
@@ -121,7 +121,7 @@ class TestPrefixExtractor : public SliceTransform {
 
  private:
   const char* separator(const Slice& key) const {
-    return reinterpret_cast<const char*>(memchr(key.data(), '_', key.size()));
+    return static_cast<const char*>(memchr(key.data(), '_', key.size()));
   }
 };
 
@@ -171,7 +171,7 @@ TEST_F(DBMemTableTest, DuplicateSeq) {
     if (!insert_dup) {
       seq++;
     }
-    Status s = mem->Add(seq, kTypeValue, "foo", "value" + ToString(seq),
+    Status s = mem->Add(seq, kTypeValue, "foo", "value" + std::to_string(seq),
                         nullptr /* kv_prot_info */);
     if (insert_dup) {
       ASSERT_TRUE(s.IsTryAgain());
@@ -262,8 +262,9 @@ TEST_F(DBMemTableTest, ConcurrentMergeWrite) {
   ReadOptions roptions;
   SequenceNumber max_covering_tombstone_seq = 0;
   LookupKey lkey("key", kMaxSequenceNumber);
-  bool res = mem->Get(lkey, &value, /*timestamp=*/nullptr, &status,
-                      &merge_context, &max_covering_tombstone_seq, roptions);
+  bool res = mem->Get(lkey, &value, /*columns=*/nullptr, /*timestamp=*/nullptr,
+                      &status, &merge_context, &max_covering_tombstone_seq,
+                      roptions, false /* immutable_memtable */);
   ASSERT_OK(status);
   ASSERT_TRUE(res);
   uint64_t ivalue = DecodeFixed64(Slice(value).data());
@@ -286,7 +287,7 @@ TEST_F(DBMemTableTest, InsertWithHint) {
   options.env = env_;
   Reopen(options);
   MockMemTableRep* rep =
-      reinterpret_cast<MockMemTableRepFactory*>(options.memtable_factory.get())
+      static_cast<MockMemTableRepFactory*>(options.memtable_factory.get())
           ->rep();
   ASSERT_OK(Put("foo_k1", "foo_v1"));
   ASSERT_EQ(nullptr, rep->last_hint_in());

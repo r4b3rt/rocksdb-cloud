@@ -8,7 +8,6 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 // Syncpoint prevents us building and running tests in release
-#ifndef ROCKSDB_LITE
 #include "rocksdb/utilities/checkpoint.h"
 
 #ifndef OS_WIN
@@ -113,7 +112,7 @@ class CheckpointTest : public testing::Test {
     ColumnFamilyOptions cf_opts(options);
     size_t cfi = handles_.size();
     handles_.resize(cfi + cfs.size());
-    for (auto cf : cfs) {
+    for (const auto& cf : cfs) {
       ASSERT_OK(db_->CreateColumnFamily(cf_opts, cf, &handles_[cfi++]));
     }
   }
@@ -136,14 +135,13 @@ class CheckpointTest : public testing::Test {
     ASSERT_OK(TryReopenWithColumnFamilies(cfs, options));
   }
 
-  Status TryReopenWithColumnFamilies(
-      const std::vector<std::string>& cfs,
-      const std::vector<Options>& options) {
+  Status TryReopenWithColumnFamilies(const std::vector<std::string>& cfs,
+                                     const std::vector<Options>& options) {
     Close();
     EXPECT_EQ(cfs.size(), options.size());
     std::vector<ColumnFamilyDescriptor> column_families;
     for (size_t i = 0; i < cfs.size(); ++i) {
-      column_families.push_back(ColumnFamilyDescriptor(cfs[i], options[i]));
+      column_families.emplace_back(cfs[i], options[i]);
     }
     DBOptions db_opts = DBOptions(options[0]);
     return DB::Open(db_opts, dbname_, column_families, &handles_, &db_);
@@ -156,9 +154,7 @@ class CheckpointTest : public testing::Test {
     return TryReopenWithColumnFamilies(cfs, v_opts);
   }
 
-  void Reopen(const Options& options) {
-    ASSERT_OK(TryReopen(options));
-  }
+  void Reopen(const Options& options) { ASSERT_OK(TryReopen(options)); }
 
   void CompactAll() {
     for (auto h : handles_) {
@@ -223,9 +219,7 @@ class CheckpointTest : public testing::Test {
     return db_->Put(wo, handles_[cf], k, v);
   }
 
-  Status Delete(const std::string& k) {
-    return db_->Delete(WriteOptions(), k);
-  }
+  Status Delete(const std::string& k) { return db_->Delete(WriteOptions(), k); }
 
   Status Delete(int cf, const std::string& k) {
     return db_->Delete(WriteOptions(), handles_[cf], k);
@@ -466,8 +460,8 @@ TEST_F(CheckpointTest, CheckpointCF) {
   Options options = CurrentOptions();
   CreateAndReopenWithCF({"one", "two", "three", "four", "five"}, options);
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency(
-      {{"CheckpointTest::CheckpointCF:2", "DBImpl::GetLiveFiles:2"},
-       {"DBImpl::GetLiveFiles:1", "CheckpointTest::CheckpointCF:1"}});
+      {{"CheckpointTest::CheckpointCF:2", "DBImpl::FlushAllColumnFamilies:2"},
+       {"DBImpl::FlushAllColumnFamilies:1", "CheckpointTest::CheckpointCF:1"}});
 
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
@@ -512,18 +506,18 @@ TEST_F(CheckpointTest, CheckpointCF) {
   std::vector<std::string> cfs;
   cfs = {kDefaultColumnFamilyName, "one", "two", "three", "four", "five"};
   std::vector<ColumnFamilyDescriptor> column_families;
-    for (size_t i = 0; i < cfs.size(); ++i) {
-      column_families.push_back(ColumnFamilyDescriptor(cfs[i], options));
-    }
-  ASSERT_OK(DB::Open(options, snapshot_name_,
-        column_families, &cphandles, &snapshotDB));
+  for (size_t i = 0; i < cfs.size(); ++i) {
+    column_families.emplace_back(cfs[i], options);
+  }
+  ASSERT_OK(DB::Open(options, snapshot_name_, column_families, &cphandles,
+                     &snapshotDB));
   ASSERT_OK(snapshotDB->Get(roptions, cphandles[0], "Default", &result));
   ASSERT_EQ("Default1", result);
   ASSERT_OK(snapshotDB->Get(roptions, cphandles[1], "one", &result));
   ASSERT_EQ("eleven", result);
   ASSERT_OK(snapshotDB->Get(roptions, cphandles[2], "two", &result));
   for (auto h : cphandles) {
-      delete h;
+    delete h;
   }
   cphandles.clear();
   delete snapshotDB;
@@ -571,7 +565,7 @@ TEST_F(CheckpointTest, CheckpointCFNoFlush) {
   cfs = {kDefaultColumnFamilyName, "one", "two", "three", "four", "five"};
   std::vector<ColumnFamilyDescriptor> column_families;
   for (size_t i = 0; i < cfs.size(); ++i) {
-    column_families.push_back(ColumnFamilyDescriptor(cfs[i], options));
+    column_families.emplace_back(cfs[i], options);
   }
   ASSERT_OK(DB::Open(options, snapshot_name_, column_families, &cphandles,
                      &snapshotDB));
@@ -723,12 +717,9 @@ TEST_F(CheckpointTest, CurrentFileModifiedWhileCheckpointing2PC) {
 
   TransactionDB* snapshotDB;
   std::vector<ColumnFamilyDescriptor> column_families;
-  column_families.push_back(
-      ColumnFamilyDescriptor(kDefaultColumnFamilyName, ColumnFamilyOptions()));
-  column_families.push_back(
-      ColumnFamilyDescriptor("CFA", ColumnFamilyOptions()));
-  column_families.push_back(
-      ColumnFamilyDescriptor("CFB", ColumnFamilyOptions()));
+  column_families.emplace_back(kDefaultColumnFamilyName, ColumnFamilyOptions());
+  column_families.emplace_back("CFA", ColumnFamilyOptions());
+  column_families.emplace_back("CFB", ColumnFamilyOptions());
   std::vector<ROCKSDB_NAMESPACE::ColumnFamilyHandle*> cf_handles;
   ASSERT_OK(TransactionDB::Open(options, txn_db_options, snapshot_name_,
                                 column_families, &cf_handles, &snapshotDB));
@@ -751,7 +742,8 @@ TEST_F(CheckpointTest, CheckpointInvalidDirectoryName) {
   for (std::string checkpoint_dir : {"", "/", "////"}) {
     Checkpoint* checkpoint;
     ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
-    ASSERT_TRUE(checkpoint->CreateCheckpoint("").IsInvalidArgument());
+    ASSERT_TRUE(
+        checkpoint->CreateCheckpoint(checkpoint_dir).IsInvalidArgument());
     delete checkpoint;
   }
 }
@@ -859,6 +851,30 @@ TEST_F(CheckpointTest, CheckpointReadOnlyDB) {
   delete snapshot_db;
 }
 
+TEST_F(CheckpointTest, CheckpointWithLockWAL) {
+  Options options = CurrentOptions();
+  ASSERT_OK(Put("foo", "foo_value"));
+
+  ASSERT_OK(db_->LockWAL());
+
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_));
+  delete checkpoint;
+  checkpoint = nullptr;
+
+  ASSERT_OK(db_->UnlockWAL());
+  Close();
+
+  DB* snapshot_db = nullptr;
+  ASSERT_OK(DB::Open(options, snapshot_name_, &snapshot_db));
+  ReadOptions read_opts;
+  std::string get_result;
+  ASSERT_OK(snapshot_db->Get(read_opts, "foo", &get_result));
+  ASSERT_EQ("foo_value", get_result);
+  delete snapshot_db;
+}
+
 TEST_F(CheckpointTest, CheckpointReadOnlyDBWithMultipleColumnFamilies) {
   Options options = CurrentOptions();
   CreateAndReopenWithCF({"pikachu", "eevee"}, options);
@@ -901,6 +917,64 @@ TEST_F(CheckpointTest, CheckpointReadOnlyDBWithMultipleColumnFamilies) {
   delete snapshot_db;
 }
 
+TEST_F(CheckpointTest, CheckpointWithDbPath) {
+  Options options = CurrentOptions();
+  options.db_paths.emplace_back(dbname_ + "_2", 0);
+  Reopen(options);
+  ASSERT_OK(Put("key1", "val1"));
+  ASSERT_OK(Flush());
+  Checkpoint* checkpoint;
+  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  // Currently not supported
+  ASSERT_TRUE(checkpoint->CreateCheckpoint(snapshot_name_).IsNotSupported());
+  delete checkpoint;
+}
+
+TEST_F(CheckpointTest, PutRaceWithCheckpointTrackedWalSync) {
+  // Repro for a race condition where a user write comes in after the checkpoint
+  // syncs WAL for `track_and_verify_wals_in_manifest` but before the
+  // corresponding MANIFEST update. With the bug, that scenario resulted in an
+  // unopenable DB with error "Corruption: Size mismatch: WAL ...".
+  Options options = CurrentOptions();
+  std::unique_ptr<FaultInjectionTestEnv> fault_env(
+      new FaultInjectionTestEnv(env_));
+  options.env = fault_env.get();
+  options.track_and_verify_wals_in_manifest = true;
+  Reopen(options);
+
+  ASSERT_OK(Put("key1", "val1"));
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWAL:BeforeMarkLogsSynced:1",
+      [this](void* /* arg */) { ASSERT_OK(Put("key2", "val2")); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  std::unique_ptr<Checkpoint> checkpoint;
+  {
+    Checkpoint* checkpoint_ptr;
+    ASSERT_OK(Checkpoint::Create(db_, &checkpoint_ptr));
+    checkpoint.reset(checkpoint_ptr);
+  }
+
+  ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_));
+
+  // Ensure callback ran.
+  ASSERT_EQ("val2", Get("key2"));
+
+  Close();
+
+  // Simulate full loss of unsynced data. This drops "key2" -> "val2" from the
+  // DB WAL.
+  ASSERT_OK(fault_env->DropUnsyncedFileData());
+
+  // Before the bug fix, reopening the DB would fail because the MANIFEST's
+  // AddWal entry indicated the WAL should be synced through "key2" -> "val2".
+  Reopen(options);
+
+  // Need to close before `fault_env` goes out of scope.
+  Close();
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
@@ -908,13 +982,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <stdio.h>
-
-int main(int /*argc*/, char** /*argv*/) {
-  fprintf(stderr, "SKIPPED as Checkpoint is not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-
-#endif  // !ROCKSDB_LITE

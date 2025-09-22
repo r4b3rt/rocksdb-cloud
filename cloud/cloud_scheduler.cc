@@ -4,9 +4,12 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+
+#include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -48,11 +51,16 @@ class CloudSchedulerImpl : public CloudScheduler {
   bool CancelJob(long handle) override;
   bool IsScheduled(long handle) override;
 
+  size_t TEST_NumScheduledJobs() const override {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return scheduled_jobs_.size();
+  }
+
  private:
   void DoWork();
   long next_id_;
 
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   // Notified when the earliest job to be scheduled has changed or
   // currently_running_ has changed.
   std::condition_variable jobs_changed_cv_;
@@ -64,21 +72,36 @@ class CloudSchedulerImpl : public CloudScheduler {
 
   std::unique_ptr<std::thread> thread_;
 };
-
 // Implementation of a CloudScheduler that keeps track of the jobs
 // it scheduled.  Only cleans up those jobs on exit or cancel.
-class LocalCloudScheduler : public CloudScheduler {
+class LocalCloudScheduler
+    : public CloudScheduler,
+      public std::enable_shared_from_this<LocalCloudScheduler> {
+  struct PrivateTag {};
+
  public:
-  LocalCloudScheduler(const std::shared_ptr<CloudScheduler>& scheduler,
+  static std::shared_ptr<CloudScheduler> Create(
+      const std::shared_ptr<CloudScheduler>& scheduler, long local_id) {
+    return std::make_shared<LocalCloudScheduler>(
+      PrivateTag(),
+      scheduler,
+      local_id);
+  }
+
+  explicit LocalCloudScheduler(PrivateTag,
+                      const std::shared_ptr<CloudScheduler>& scheduler,
                       long local_id)
       : scheduler_(scheduler),
-        next_local_id_(local_id),
-        shutting_down_(false) {}
+        next_local_id_(local_id) {}
   ~LocalCloudScheduler() override {
-    {
-      std::lock_guard<std::mutex> lk(job_mutex_);
-      shutting_down_ = true;
-    }
+    TEST_SYNC_POINT(
+        "LocalCloudScheduler::~LocalCloudScheduler:BeforeCancelJobs1");
+    TEST_SYNC_POINT(
+        "LocalCloudScheduler::~LocalCloudScheduler:BeforeCancelJobs2");
+    // NOTE: there is no need to lock job_mutex_ here. LocalCloudScheduler can
+    // only be accessed through shared_ptr. If destructor is called, there is no
+    // way to schedule new jobs. Also, we lock the weak_ptr in the schedule job
+    // callback to make sure it won't race with the destructor
     for (const auto& job : jobs_) {
       scheduler_->CancelJob(job.second);
     }
@@ -87,15 +110,22 @@ class LocalCloudScheduler : public CloudScheduler {
 
   long ScheduleJob(std::chrono::microseconds when,
                    std::function<void(void*)> callback, void* arg) override {
-    if (shutting_down_) {
-      return -1;
-    }
     std::lock_guard<std::mutex> lk(job_mutex_);
     long local_id = next_local_id_++;
-    auto job = [this, local_id, callback](void* a) {
+    auto wp = this->weak_from_this();
+    auto job = [local_id, callback, wp = std::move(wp)](void* a) {
       callback(a);
-      std::lock_guard<std::mutex> cblk(job_mutex_);
-      jobs_.erase(local_id);
+      TEST_SYNC_POINT("LocalCloudScheduler::ScheduleJob:BeforeEraseJob");
+      auto sp = wp.lock();
+      bool job_erased = false;
+      if (sp) {
+        job_erased = true;
+        sp->DoEraseJob(local_id);
+      }
+      TEST_SYNC_POINT_CALLBACK(
+          "LocalCloudScheduler::ScheduleJob:AfterEraseJob", &job_erased);
+      // make sure `job_erased` is not unused variable when compiling in release mode
+      (void)job_erased;
     };
     jobs_[local_id] = scheduler_->ScheduleJob(when, job, arg);
     return local_id;
@@ -105,9 +135,6 @@ class LocalCloudScheduler : public CloudScheduler {
                             std::chrono::microseconds frequency,
                             std::function<void(void*)> callback,
                             void* arg) override {
-    if (shutting_down_) {
-      return -1;
-    }
     auto job = scheduler_->ScheduleRecurringJob(when, frequency, callback, arg);
     std::lock_guard<std::mutex> lk(job_mutex_);
     long local_id = next_local_id_++;
@@ -116,23 +143,19 @@ class LocalCloudScheduler : public CloudScheduler {
   }
 
   bool IsScheduled(long handle) override {
-    if (shutting_down_) {
+    std::lock_guard<std::mutex> lk(job_mutex_);
+    const auto& it = jobs_.find(handle);
+    if (it == jobs_.end()) {
+      // We do not have the job in our queue.  Return false
       return false;
+    } else if (scheduler_->IsScheduled(it->second)) {
+      // The job is still scheduled.  Return false
+      return true;
     } else {
-      std::lock_guard<std::mutex> lk(job_mutex_);
-      const auto& it = jobs_.find(handle);
-      if (it == jobs_.end()) {
-        // We do not have the job in our queue.  Return false
-        return false;
-      } else if (scheduler_->IsScheduled(it->second)) {
-        // The job is still scheduled.  Return false
-        return true;
-      } else {
-        // We have the job in our queue but it has already
-        // completed.  Erase from our queue and return false
-        jobs_.erase(it);
-        return false;
-      }
+      // We have the job in our queue but it has already
+      // completed.  Erase from our queue and return false
+      jobs_.erase(it);
+      return false;
     }
   }
 
@@ -154,12 +177,21 @@ class LocalCloudScheduler : public CloudScheduler {
     return scheduler_->CancelJob(internal_job_id);
   }
 
+  size_t TEST_NumScheduledJobs() const override {
+    std::lock_guard<std::mutex> lk(job_mutex_);
+    return jobs_.size();
+  }
+
  private:
-  std::mutex job_mutex_;
+  mutable std::mutex job_mutex_;
   std::shared_ptr<CloudScheduler> scheduler_;
   long next_local_id_;
-  bool shutting_down_;
   std::unordered_map<long, long> jobs_;
+
+  void DoEraseJob(long local_id) {
+    std::lock_guard<std::mutex> cblk(job_mutex_);
+    jobs_.erase(local_id);
+  }
 };
 
 std::shared_ptr<CloudScheduler> CloudScheduler::Get() {
@@ -168,7 +200,7 @@ std::shared_ptr<CloudScheduler> CloudScheduler::Get() {
   static long local_scheduler_id = 0;
 
   std::shared_ptr<CloudScheduler> result =
-      std::make_shared<LocalCloudScheduler>(scheduler, local_scheduler_id);
+      LocalCloudScheduler::Create(scheduler, local_scheduler_id);
   local_scheduler_id += 10000;
   return result;
 }
@@ -277,6 +309,9 @@ bool CloudSchedulerImpl::CancelJob(long id) {
 
 void CloudSchedulerImpl::DoWork() {
   while (true) {
+    // This sync point has to be put before locking mutex_, otherwise
+    // CancelJob won't be able to acquire mutex when called
+    TEST_SYNC_POINT("CloudSchedulerImpl::DoWork:BeforeGetJob");
     std::unique_lock<std::mutex> lk(mutex_);
     if (shutting_down_) {
       break;

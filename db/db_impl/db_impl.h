@@ -16,12 +16,14 @@
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "db/column_family.h"
+#include "db/compaction/compaction_iterator.h"
 #include "db/compaction/compaction_job.h"
-#include "db/dbformat.h"
+#include "db/db_impl/replication_codec.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "db/external_sst_file_ingestion_job.h"
@@ -32,8 +34,11 @@
 #include "db/log_writer.h"
 #include "db/logs_with_prep_tracker.h"
 #include "db/memtable_list.h"
+#include "db/periodic_task_scheduler.h"
+#include "db/post_memtable_callback.h"
 #include "db/range_del_aggregator.h"
 #include "db/read_callback.h"
+#include "db/seqno_to_time_mapping.h"
 #include "db/snapshot_checker.h"
 #include "db/snapshot_impl.h"
 #include "db/trim_history_scheduler.h"
@@ -52,8 +57,9 @@
 #include "rocksdb/status.h"
 #include "rocksdb/trace_reader_writer.h"
 #include "rocksdb/transaction_log.h"
+#include "rocksdb/utilities/replayer.h"
 #include "rocksdb/write_buffer_manager.h"
-#include "table/scoped_arena_iterator.h"
+#include "table/merging_iterator.h"
 #include "util/autovector.h"
 #include "util/hash.h"
 #include "util/repeatable_thread.h"
@@ -67,10 +73,6 @@ class ArenaWrappedDBIter;
 class InMemoryStatsHistoryIterator;
 class MemTable;
 class PersistentStatsHistoryIterator;
-class PeriodicWorkScheduler;
-#ifndef NDEBUG
-class PeriodicWorkTestScheduler;
-#endif  // !NDEBUG
 class TableCache;
 class TaskLimiterToken;
 class Version;
@@ -80,6 +82,7 @@ class WriteCallback;
 struct JobContext;
 struct ExternalSstFileInfo;
 struct MemTableInfo;
+struct MemTableLogNumAndReplSeq;
 
 // Class to maintain directories for all database paths other than main one.
 class Directories {
@@ -106,6 +109,49 @@ class Directories {
   }
 
   FSDirectory* GetDbDir() { return db_dir_.get(); }
+
+  IOStatus Close(const IOOptions& options, IODebugContext* dbg) {
+    // close all directories for all database paths
+    IOStatus s = IOStatus::OK();
+
+    // The default implementation for Close() in Directory/FSDirectory class
+    // "NotSupported" status, the upper level interface should be able to
+    // handle this error so that Close() does not fail after upgrading when
+    // run on FileSystems that have not implemented `Directory::Close()` or
+    // `FSDirectory::Close()` yet
+
+    if (db_dir_) {
+      IOStatus temp_s = db_dir_->Close(options, dbg);
+      if (!temp_s.ok() && !temp_s.IsNotSupported() && s.ok()) {
+        s = std::move(temp_s);
+      }
+    }
+
+    // Attempt to close everything even if one fails
+    s.PermitUncheckedError();
+
+    if (wal_dir_) {
+      IOStatus temp_s = wal_dir_->Close(options, dbg);
+      if (!temp_s.ok() && !temp_s.IsNotSupported() && s.ok()) {
+        s = std::move(temp_s);
+      }
+    }
+
+    s.PermitUncheckedError();
+
+    for (auto& data_dir_ptr : data_dirs_) {
+      if (data_dir_ptr) {
+        IOStatus temp_s = data_dir_ptr->Close(options, dbg);
+        if (!temp_s.ok() && !temp_s.IsNotSupported() && s.ok()) {
+          s = std::move(temp_s);
+        }
+      }
+    }
+
+    // Ready for caller
+    s.MustCheck();
+    return s;
+  }
 
  private:
   std::unique_ptr<FSDirectory> db_dir_;
@@ -140,35 +186,63 @@ class DBImpl : public DB {
   // ---- Implementations of the DB interface ----
 
   using DB::Resume;
-  virtual Status Resume() override;
+  Status Resume() override;
 
   using DB::Put;
-  virtual Status Put(const WriteOptions& options,
-                     ColumnFamilyHandle* column_family, const Slice& key,
-                     const Slice& value) override;
+  Status Put(const WriteOptions& options, ColumnFamilyHandle* column_family,
+             const Slice& key, const Slice& value) override;
+  Status Put(const WriteOptions& options, ColumnFamilyHandle* column_family,
+             const Slice& key, const Slice& ts, const Slice& value) override;
+
+  using DB::PutEntity;
+  Status PutEntity(const WriteOptions& options,
+                   ColumnFamilyHandle* column_family, const Slice& key,
+                   const WideColumns& columns) override;
+  Status PutEntity(const WriteOptions& options, const Slice& key,
+                   const AttributeGroups& attribute_groups) override;
+
   using DB::Merge;
-  virtual Status Merge(const WriteOptions& options,
-                       ColumnFamilyHandle* column_family, const Slice& key,
-                       const Slice& value) override;
+  Status Merge(const WriteOptions& options, ColumnFamilyHandle* column_family,
+               const Slice& key, const Slice& value) override;
+  Status Merge(const WriteOptions& options, ColumnFamilyHandle* column_family,
+               const Slice& key, const Slice& ts, const Slice& value) override;
+
   using DB::Delete;
-  virtual Status Delete(const WriteOptions& options,
-                        ColumnFamilyHandle* column_family,
-                        const Slice& key) override;
+  Status Delete(const WriteOptions& options, ColumnFamilyHandle* column_family,
+                const Slice& key) override;
+  Status Delete(const WriteOptions& options, ColumnFamilyHandle* column_family,
+                const Slice& key, const Slice& ts) override;
+
   using DB::SingleDelete;
-  virtual Status SingleDelete(const WriteOptions& options,
-                              ColumnFamilyHandle* column_family,
-                              const Slice& key) override;
+  Status SingleDelete(const WriteOptions& options,
+                      ColumnFamilyHandle* column_family,
+                      const Slice& key) override;
+  Status SingleDelete(const WriteOptions& options,
+                      ColumnFamilyHandle* column_family, const Slice& key,
+                      const Slice& ts) override;
+
+  using DB::DeleteRange;
+  Status DeleteRange(const WriteOptions& options,
+                     ColumnFamilyHandle* column_family, const Slice& begin_key,
+                     const Slice& end_key) override;
+  Status DeleteRange(const WriteOptions& options,
+                     ColumnFamilyHandle* column_family, const Slice& begin_key,
+                     const Slice& end_key, const Slice& ts) override;
+
   using DB::Write;
-  virtual Status Write(const WriteOptions& options,
-                       WriteBatch* updates) override;
+  Status Write(const WriteOptions& options, WriteBatch* updates) override;
 
   using DB::Get;
-  virtual Status Get(const ReadOptions& options,
-                     ColumnFamilyHandle* column_family, const Slice& key,
-                     PinnableSlice* value) override;
-  virtual Status Get(const ReadOptions& options,
-                     ColumnFamilyHandle* column_family, const Slice& key,
-                     PinnableSlice* value, std::string* timestamp) override;
+  Status Get(const ReadOptions& _read_options,
+             ColumnFamilyHandle* column_family, const Slice& key,
+             PinnableSlice* value, std::string* timestamp) override;
+
+  using DB::GetEntity;
+  Status GetEntity(const ReadOptions& options,
+                   ColumnFamilyHandle* column_family, const Slice& key,
+                   PinnableWideColumns* columns) override;
+  Status GetEntity(const ReadOptions& options, const Slice& key,
+                   PinnableAttributeGroups* result) override;
 
   using DB::GetMergeOperands;
   Status GetMergeOperands(const ReadOptions& options,
@@ -186,17 +260,6 @@ class DBImpl : public DB {
   }
 
   using DB::MultiGet;
-  virtual std::vector<Status> MultiGet(
-      const ReadOptions& options,
-      const std::vector<ColumnFamilyHandle*>& column_family,
-      const std::vector<Slice>& keys,
-      std::vector<std::string>* values) override;
-  virtual std::vector<Status> MultiGet(
-      const ReadOptions& options,
-      const std::vector<ColumnFamilyHandle*>& column_family,
-      const std::vector<Slice>& keys, std::vector<std::string>* values,
-      std::vector<std::string>* timestamps) override;
-
   // This MultiGet is a batched version, which may be faster than calling Get
   // multiple times, especially if the keys have some spatial locality that
   // enables them to be queried in the same SST files/set of files. The larger
@@ -204,45 +267,70 @@ class DBImpl : public DB {
   // The values and statuses parameters are arrays with number of elements
   // equal to keys.size(). This allows the storage for those to be alloacted
   // by the caller on the stack for small batches
-  virtual void MultiGet(const ReadOptions& options,
-                        ColumnFamilyHandle* column_family,
-                        const size_t num_keys, const Slice* keys,
-                        PinnableSlice* values, Status* statuses,
-                        const bool sorted_input = false) override;
-  virtual void MultiGet(const ReadOptions& options,
-                        ColumnFamilyHandle* column_family,
-                        const size_t num_keys, const Slice* keys,
-                        PinnableSlice* values, std::string* timestamps,
-                        Status* statuses,
-                        const bool sorted_input = false) override;
+  void MultiGet(const ReadOptions& _read_options, const size_t num_keys,
+                ColumnFamilyHandle** column_families, const Slice* keys,
+                PinnableSlice* values, std::string* timestamps,
+                Status* statuses, const bool sorted_input = false) override;
 
-  virtual void MultiGet(const ReadOptions& options, const size_t num_keys,
-                        ColumnFamilyHandle** column_families, const Slice* keys,
-                        PinnableSlice* values, Status* statuses,
-                        const bool sorted_input = false) override;
-  virtual void MultiGet(const ReadOptions& options, const size_t num_keys,
-                        ColumnFamilyHandle** column_families, const Slice* keys,
-                        PinnableSlice* values, std::string* timestamps,
-                        Status* statuses,
-                        const bool sorted_input = false) override;
-
-  virtual void MultiGetWithCallback(
-      const ReadOptions& options, ColumnFamilyHandle* column_family,
+  void MultiGetWithCallback(
+      const ReadOptions& _read_options, ColumnFamilyHandle* column_family,
       ReadCallback* callback,
       autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* sorted_keys);
 
-  virtual Status CreateColumnFamily(const ColumnFamilyOptions& cf_options,
+  using DB::MultiGetEntity;
+
+  void MultiGetEntity(const ReadOptions& options,
+                      ColumnFamilyHandle* column_family, size_t num_keys,
+                      const Slice* keys, PinnableWideColumns* results,
+                      Status* statuses, bool sorted_input) override;
+
+  void MultiGetEntity(const ReadOptions& options, size_t num_keys,
+                      ColumnFamilyHandle** column_families, const Slice* keys,
+                      PinnableWideColumns* results, Status* statuses,
+                      bool sorted_input) override;
+  void MultiGetEntity(const ReadOptions& options, size_t num_keys,
+                      const Slice* keys,
+                      PinnableAttributeGroups* results) override;
+
+  Status CreateColumnFamily(const ColumnFamilyOptions& cf_options,
+                            const std::string& column_family,
+                            ColumnFamilyHandle** handle) override {
+    // TODO: plumb Env::IOActivity, Env::IOPriority
+    return CreateColumnFamily(ReadOptions(), WriteOptions(), cf_options,
+                              column_family, handle);
+  }
+  virtual Status CreateColumnFamily(const ReadOptions& read_options,
+                                    const WriteOptions& write_options,
+                                    const ColumnFamilyOptions& cf_options,
                                     const std::string& column_family,
-                                    ColumnFamilyHandle** handle) override;
-  virtual Status CreateColumnFamilies(
+                                    ColumnFamilyHandle** handle);
+  Status CreateColumnFamilies(
       const ColumnFamilyOptions& cf_options,
       const std::vector<std::string>& column_family_names,
-      std::vector<ColumnFamilyHandle*>* handles) override;
+      std::vector<ColumnFamilyHandle*>* handles) override {
+    // TODO: plumb Env::IOActivity, Env::IOPriority
+    return CreateColumnFamilies(ReadOptions(), WriteOptions(), cf_options,
+                                column_family_names, handles);
+  }
   virtual Status CreateColumnFamilies(
+      const ReadOptions& read_options, const WriteOptions& write_options,
+      const ColumnFamilyOptions& cf_options,
+      const std::vector<std::string>& column_family_names,
+      std::vector<ColumnFamilyHandle*>* handles);
+
+  Status CreateColumnFamilies(
       const std::vector<ColumnFamilyDescriptor>& column_families,
-      std::vector<ColumnFamilyHandle*>* handles) override;
-  virtual Status DropColumnFamily(ColumnFamilyHandle* column_family) override;
-  virtual Status DropColumnFamilies(
+      std::vector<ColumnFamilyHandle*>* handles) override {
+    // TODO: plumb Env::IOActivity, Env::IOPriority
+    return CreateColumnFamilies(ReadOptions(), WriteOptions(), column_families,
+                                handles);
+  }
+  virtual Status CreateColumnFamilies(
+      const ReadOptions& read_options, const WriteOptions& write_options,
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      std::vector<ColumnFamilyHandle*>* handles);
+  Status DropColumnFamily(ColumnFamilyHandle* column_family) override;
+  Status DropColumnFamilies(
       const std::vector<ColumnFamilyHandle*>& column_families) override;
 
   // Returns false if key doesn't exist in the database and true if it may.
@@ -250,51 +338,76 @@ class DBImpl : public DB {
   // memory. On return, if value was found, then value_found will be set to true
   // , otherwise false.
   using DB::KeyMayExist;
-  virtual bool KeyMayExist(const ReadOptions& options,
-                           ColumnFamilyHandle* column_family, const Slice& key,
-                           std::string* value, std::string* timestamp,
-                           bool* value_found = nullptr) override;
+  bool KeyMayExist(const ReadOptions& options,
+                   ColumnFamilyHandle* column_family, const Slice& key,
+                   std::string* value, std::string* timestamp,
+                   bool* value_found = nullptr) override;
 
   using DB::NewIterator;
-  virtual Iterator* NewIterator(const ReadOptions& options,
-                                ColumnFamilyHandle* column_family) override;
-  virtual Status NewIterators(
+  Iterator* NewIterator(const ReadOptions& _read_options,
+                        ColumnFamilyHandle* column_family) override;
+  Status NewIterators(const ReadOptions& _read_options,
+                      const std::vector<ColumnFamilyHandle*>& column_families,
+                      std::vector<Iterator*>* iterators) override;
+
+  // UNDER CONSTRUCTION - DO NOT USE
+  // Return a cross-column-family iterator from a consistent database state.
+  std::unique_ptr<Iterator> NewMultiCfIterator(
       const ReadOptions& options,
+      const std::vector<ColumnFamilyHandle*>& column_families) override;
+
+  SequenceNumber GetIteratorSequenceNumber(Iterator* it) override;
+
+  // RocksDB-Cloud contribution begin
+  Status GetSuperSnapshots(
       const std::vector<ColumnFamilyHandle*>& column_families,
-      std::vector<Iterator*>* iterators) override;
+      std::vector<const Snapshot*>* snapshots) override;
+  // RocksDB-Cloud contribution end
 
   virtual const Snapshot* GetSnapshot() override;
   virtual void ReleaseSnapshot(const Snapshot* snapshot) override;
+
+  // Create a timestamped snapshot. This snapshot can be shared by multiple
+  // readers. If any of them uses it for write conflict checking, then
+  // is_write_conflict_boundary is true. For simplicity, set it to true by
+  // default.
+  std::pair<Status, std::shared_ptr<const Snapshot>> CreateTimestampedSnapshot(
+      SequenceNumber snapshot_seq, uint64_t ts);
+  std::shared_ptr<const SnapshotImpl> GetTimestampedSnapshot(uint64_t ts) const;
+  void ReleaseTimestampedSnapshotsOlderThan(
+      uint64_t ts, size_t* remaining_total_ss = nullptr);
+  Status GetTimestampedSnapshots(uint64_t ts_lb, uint64_t ts_ub,
+                                 std::vector<std::shared_ptr<const Snapshot>>&
+                                     timestamped_snapshots) const;
+
   using DB::GetProperty;
-  virtual bool GetProperty(ColumnFamilyHandle* column_family,
-                           const Slice& property, std::string* value) override;
+  bool GetProperty(ColumnFamilyHandle* column_family, const Slice& property,
+                   std::string* value) override;
   using DB::GetMapProperty;
-  virtual bool GetMapProperty(
-      ColumnFamilyHandle* column_family, const Slice& property,
-      std::map<std::string, std::string>* value) override;
+  bool GetMapProperty(ColumnFamilyHandle* column_family, const Slice& property,
+                      std::map<std::string, std::string>* value) override;
   using DB::GetIntProperty;
-  virtual bool GetIntProperty(ColumnFamilyHandle* column_family,
-                              const Slice& property, uint64_t* value) override;
+  bool GetIntProperty(ColumnFamilyHandle* column_family, const Slice& property,
+                      uint64_t* value) override;
   using DB::GetAggregatedIntProperty;
-  virtual bool GetAggregatedIntProperty(const Slice& property,
-                                        uint64_t* aggregated_value) override;
+  bool GetAggregatedIntProperty(const Slice& property,
+                                uint64_t* aggregated_value) override;
   using DB::GetApproximateSizes;
-  virtual Status GetApproximateSizes(const SizeApproximationOptions& options,
-                                     ColumnFamilyHandle* column_family,
-                                     const Range* range, int n,
-                                     uint64_t* sizes) override;
+  Status GetApproximateSizes(const SizeApproximationOptions& options,
+                             ColumnFamilyHandle* column_family,
+                             const Range* range, int n,
+                             uint64_t* sizes) override;
   using DB::GetApproximateMemTableStats;
-  virtual void GetApproximateMemTableStats(ColumnFamilyHandle* column_family,
-                                           const Range& range,
-                                           uint64_t* const count,
-                                           uint64_t* const size) override;
+  void GetApproximateMemTableStats(ColumnFamilyHandle* column_family,
+                                   const Range& range, uint64_t* const count,
+                                   uint64_t* const size) override;
   using DB::CompactRange;
-  virtual Status CompactRange(const CompactRangeOptions& options,
-                              ColumnFamilyHandle* column_family,
-                              const Slice* begin, const Slice* end) override;
+  Status CompactRange(const CompactRangeOptions& options,
+                      ColumnFamilyHandle* column_family, const Slice* begin,
+                      const Slice* end) override;
 
   using DB::CompactFiles;
-  virtual Status CompactFiles(
+  Status CompactFiles(
       const CompactionOptions& compact_options,
       ColumnFamilyHandle* column_family,
       const std::vector<std::string>& input_file_names, const int output_level,
@@ -302,68 +415,95 @@ class DBImpl : public DB {
       std::vector<std::string>* const output_file_names = nullptr,
       CompactionJobInfo* compaction_job_info = nullptr) override;
 
-  virtual Status PauseBackgroundWork() override;
-  virtual Status ContinueBackgroundWork() override;
+  Status PauseBackgroundWork() override;
+  Status ContinueBackgroundWork() override;
 
-  virtual Status EnableAutoCompaction(
+  Status EnableAutoCompaction(
       const std::vector<ColumnFamilyHandle*>& column_family_handles) override;
 
-  virtual void EnableManualCompaction() override;
-  virtual void DisableManualCompaction() override;
+  void EnableManualCompaction() override;
+  void DisableManualCompaction() override;
+
+  Status ApplyReplicationLogRecord(ReplicationLogRecord record,
+                                   std::string replication_sequence,
+                                   CFOptionsFactory cf_options_factory,
+                                   uint64_t snapshot_replication_epoch,
+                                   ApplyReplicationLogRecordInfo* info,
+                                   unsigned flags) override;
+
+  // Check that replicated epoch number of newly flushed files >= cfd's next
+  // epoch number.
+  Status CheckNextEpochNumberConsistency(const VersionEdit& e, ColumnFamilyData* cfd);
+  Status GetReplicationRecordDebugString(
+      const ReplicationLogRecord& record, std::string* out) const override;
+  Status GetPersistedReplicationSequence(std::string* out) override;
+  Status GetManifestUpdateSequence(uint64_t* out) override;
 
   using DB::SetOptions;
   Status SetOptions(
       ColumnFamilyHandle* column_family,
       const std::unordered_map<std::string, std::string>& options_map) override;
 
-  virtual Status SetDBOptions(
+  Status SetDBOptions(
       const std::unordered_map<std::string, std::string>& options_map) override;
 
   using DB::NumberLevels;
-  virtual int NumberLevels(ColumnFamilyHandle* column_family) override;
+  int NumberLevels(ColumnFamilyHandle* column_family) override;
   using DB::MaxMemCompactionLevel;
-  virtual int MaxMemCompactionLevel(ColumnFamilyHandle* column_family) override;
+  int MaxMemCompactionLevel(ColumnFamilyHandle* column_family) override;
   using DB::Level0StopWriteTrigger;
-  virtual int Level0StopWriteTrigger(
-      ColumnFamilyHandle* column_family) override;
-  virtual const std::string& GetName() const override;
-  virtual Env* GetEnv() const override;
-  virtual FileSystem* GetFileSystem() const override;
+  int Level0StopWriteTrigger(ColumnFamilyHandle* column_family) override;
+  const std::string& GetName() const override;
+  Env* GetEnv() const override;
+  FileSystem* GetFileSystem() const override;
   using DB::GetOptions;
-  virtual Options GetOptions(ColumnFamilyHandle* column_family) const override;
+  Options GetOptions(ColumnFamilyHandle* column_family) const override;
   using DB::GetDBOptions;
-  virtual DBOptions GetDBOptions() const override;
+  DBOptions GetDBOptions() const override;
   using DB::Flush;
-  virtual Status Flush(const FlushOptions& options,
-                       ColumnFamilyHandle* column_family) override;
-  virtual Status Flush(
+  Status Flush(const FlushOptions& options,
+               ColumnFamilyHandle* column_family) override;
+  Status Flush(
       const FlushOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_families) override;
-  virtual Status FlushWAL(bool sync) override;
-  bool TEST_WALBufferIsEmpty(bool lock = true);
-  virtual Status SyncWAL() override;
-  virtual Status LockWAL() override;
-  virtual Status UnlockWAL() override;
+  Status FlushWAL(bool sync) override {
+    // TODO: plumb Env::IOActivity, Env::IOPriority
+    return FlushWAL(WriteOptions(), sync);
+  }
 
-  virtual SequenceNumber GetLatestSequenceNumber() const override;
+  virtual Status FlushWAL(const WriteOptions& write_options, bool sync);
+  bool WALBufferIsEmpty();
+  Status SyncWAL() override;
+  Status LockWAL() override;
+  Status UnlockWAL() override;
 
-  virtual bool SetPreserveDeletesSequenceNumber(SequenceNumber seqnum) override;
+  SequenceNumber GetLatestSequenceNumber() const override;
 
-  virtual Status GetDbIdentity(std::string& identity) const override;
+  // IncreaseFullHistoryTsLow(ColumnFamilyHandle*, std::string) will acquire
+  // and release db_mutex
+  Status IncreaseFullHistoryTsLow(ColumnFamilyHandle* column_family,
+                                  std::string ts_low) override;
+
+  // GetFullHistoryTsLow(ColumnFamilyHandle*, std::string*) will acquire and
+  // release db_mutex
+  Status GetFullHistoryTsLow(ColumnFamilyHandle* column_family,
+                             std::string* ts_low) override;
+
+  Status GetDbIdentity(std::string& identity) const override;
 
   virtual Status GetDbIdentityFromIdentityFile(std::string* identity) const;
 
-  virtual Status GetDbSessionId(std::string& session_id) const override;
+  Status GetDbSessionId(std::string& session_id) const override;
 
   ColumnFamilyHandle* DefaultColumnFamily() const override;
 
   ColumnFamilyHandle* PersistentStatsColumnFamily() const;
 
-  virtual Status Close() override;
+  Status Close() override;
 
-  virtual Status DisableFileDeletions() override;
+  Status DisableFileDeletions() override;
 
-  virtual Status EnableFileDeletions(bool force) override;
+  Status EnableFileDeletions() override;
 
   virtual bool IsFileDeletionsEnabled() const;
 
@@ -371,46 +511,39 @@ class DBImpl : public DB {
       uint64_t start_time, uint64_t end_time,
       std::unique_ptr<StatsHistoryIterator>* stats_iterator) override;
 
-  // If immutable_db_options_.best_efforts_recovery is true, and
-  // RocksDbFileChecksumsVerificationEnabledOnRecovery is defined and returns
-  // true, and immutable_db_options_.file_checksum_gen_factory is not nullptr,
-  // then call VerifyFileChecksums().
-  Status MaybeVerifyFileChecksums();
-
-#ifndef ROCKSDB_LITE
   using DB::ResetStats;
-  virtual Status ResetStats() override;
+  Status ResetStats() override;
   // All the returned filenames start with "/"
-  virtual Status GetLiveFiles(std::vector<std::string>&,
-                              uint64_t* manifest_file_size,
-                              bool flush_memtable = true) override;
-  virtual Status GetSortedWalFiles(VectorLogPtr& files) override;
-  virtual Status GetCurrentWalFile(
-      std::unique_ptr<LogFile>* current_log_file) override;
-  virtual Status GetCreationTimeOfOldestFile(
-      uint64_t* creation_time) override;
+  Status GetLiveFiles(std::vector<std::string>&, uint64_t* manifest_file_size,
+                      bool flush_memtable = true) override;
+  Status GetSortedWalFiles(VectorLogPtr& files) override;
+  Status GetCurrentWalFile(std::unique_ptr<LogFile>* current_log_file) override;
+  Status GetCreationTimeOfOldestFile(uint64_t* creation_time) override;
 
-  virtual Status GetUpdatesSince(
+  Status GetUpdatesSince(
       SequenceNumber seq_number, std::unique_ptr<TransactionLogIterator>* iter,
       const TransactionLogIterator::ReadOptions& read_options =
           TransactionLogIterator::ReadOptions()) override;
-  virtual Status DeleteFile(std::string name) override;
+  Status DeleteFile(std::string name) override;
   Status DeleteFilesInRanges(ColumnFamilyHandle* column_family,
                              const RangePtr* ranges, size_t n,
                              bool include_end = true);
 
-  virtual void GetLiveFilesMetaData(
-      std::vector<LiveFileMetaData>* metadata) override;
+  void GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) override;
 
-  virtual Status GetLiveFilesChecksumInfo(
-      FileChecksumList* checksum_list) override;
+  Status GetLiveFilesChecksumInfo(FileChecksumList* checksum_list) override;
+
+  Status GetLiveFilesStorageInfo(
+      const LiveFilesStorageInfoOptions& opts,
+      std::vector<LiveFileStorageInfo>* files) override;
 
   // Obtains the meta data of the specified column family of the DB.
-  // Status::NotFound() will be returned if the current DB does not have
-  // any column family match the specified name.
   // TODO(yhchiang): output parameter is placed in the end in this codebase.
-  virtual void GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
-                                       ColumnFamilyMetaData* metadata) override;
+  void GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
+                               ColumnFamilyMetaData* metadata) override;
+
+  void GetAllColumnFamilyMetaData(
+      std::vector<ColumnFamilyMetaData>* metadata) override;
 
   Status SuggestCompactRange(ColumnFamilyHandle* column_family,
                              const Slice* begin, const Slice* end) override;
@@ -419,27 +552,32 @@ class DBImpl : public DB {
                    int target_level) override;
 
   using DB::IngestExternalFile;
-  virtual Status IngestExternalFile(
+  Status IngestExternalFile(
       ColumnFamilyHandle* column_family,
       const std::vector<std::string>& external_files,
       const IngestExternalFileOptions& ingestion_options) override;
 
   using DB::IngestExternalFiles;
-  virtual Status IngestExternalFiles(
+  Status IngestExternalFiles(
       const std::vector<IngestExternalFileArg>& args) override;
 
   using DB::CreateColumnFamilyWithImport;
-  virtual Status CreateColumnFamilyWithImport(
+  Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& options, const std::string& column_family_name,
       const ImportColumnFamilyOptions& import_options,
-      const ExportImportFilesMetaData& metadata,
+      const std::vector<const ExportImportFilesMetaData*>& metadatas,
       ColumnFamilyHandle** handle) override;
+
+  using DB::ClipColumnFamily;
+  Status ClipColumnFamily(ColumnFamilyHandle* column_family,
+                          const Slice& begin_key,
+                          const Slice& end_key) override;
 
   using DB::VerifyFileChecksums;
   Status VerifyFileChecksums(const ReadOptions& read_options) override;
 
   using DB::VerifyChecksum;
-  virtual Status VerifyChecksum(const ReadOptions& /*read_options*/) override;
+  Status VerifyChecksum(const ReadOptions& /*read_options*/) override;
   // Verify the checksums of files in db. Currently only tables are checked.
   //
   // read_options: controls file I/O behavior, e.g. read ahead size while
@@ -460,17 +598,25 @@ class DBImpl : public DB {
                                 const ReadOptions& read_options);
 
   using DB::StartTrace;
-  virtual Status StartTrace(
-      const TraceOptions& options,
-      std::unique_ptr<TraceWriter>&& trace_writer) override;
+  Status StartTrace(const TraceOptions& options,
+                    std::unique_ptr<TraceWriter>&& trace_writer) override;
 
   using DB::EndTrace;
-  virtual Status EndTrace() override;
+  Status EndTrace() override;
+
+  using DB::NewDefaultReplayer;
+  Status NewDefaultReplayer(const std::vector<ColumnFamilyHandle*>& handles,
+                            std::unique_ptr<TraceReader>&& reader,
+                            std::unique_ptr<Replayer>* replayer) override;
 
   using DB::StartBlockCacheTrace;
   Status StartBlockCacheTrace(
-      const TraceOptions& options,
+      const TraceOptions& trace_options,
       std::unique_ptr<TraceWriter>&& trace_writer) override;
+
+  Status StartBlockCacheTrace(
+      const BlockCacheTraceOptions& options,
+      std::unique_ptr<BlockCacheTraceWriter>&& trace_writer) override;
 
   using DB::EndBlockCacheTrace;
   Status EndBlockCacheTrace() override;
@@ -483,14 +629,11 @@ class DBImpl : public DB {
   Status EndIOTrace() override;
 
   using DB::GetPropertiesOfAllTables;
-  virtual Status GetPropertiesOfAllTables(
-      ColumnFamilyHandle* column_family,
-      TablePropertiesCollection* props) override;
-  virtual Status GetPropertiesOfTablesInRange(
+  Status GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
+                                  TablePropertiesCollection* props) override;
+  Status GetPropertiesOfTablesInRange(
       ColumnFamilyHandle* column_family, const Range* range, std::size_t n,
       TablePropertiesCollection* props) override;
-
-#endif  // ROCKSDB_LITE
 
   // ---- End of implementations of the DB interface ----
   SystemClock* GetSystemClock() const;
@@ -498,6 +641,7 @@ class DBImpl : public DB {
   struct GetImplOptions {
     ColumnFamilyHandle* column_family = nullptr;
     PinnableSlice* value = nullptr;
+    PinnableWideColumns* columns = nullptr;
     std::string* timestamp = nullptr;
     bool* value_found = nullptr;
     ReadCallback* callback = nullptr;
@@ -513,6 +657,14 @@ class DBImpl : public DB {
     int* number_of_operands = nullptr;
   };
 
+  Status GetImpl(const ReadOptions& read_options,
+                 ColumnFamilyHandle* column_family, const Slice& key,
+                 PinnableSlice* value);
+
+  Status GetImpl(const ReadOptions& read_options,
+                 ColumnFamilyHandle* column_family, const Slice& key,
+                 PinnableSlice* value, std::string* timestamp);
+
   // Function that Get and KeyMayExist call with no_io true or false
   // Note: 'value_found' from KeyMayExist propagates here
   // This function is also called by GetMergeOperands
@@ -520,13 +672,13 @@ class DBImpl : public DB {
   // get_impl_options.key via get_impl_options.value
   // If get_impl_options.get_value = false get merge operands associated with
   // get_impl_options.key via get_impl_options.merge_operands
-  Status GetImpl(const ReadOptions& options, const Slice& key,
-                 GetImplOptions& get_impl_options);
+  virtual Status GetImpl(const ReadOptions& options, const Slice& key,
+                         GetImplOptions& get_impl_options);
 
   // If `snapshot` == kMaxSequenceNumber, set a recent one inside the file.
   ArenaWrappedDBIter* NewIteratorImpl(const ReadOptions& options,
-                                      ColumnFamilyData* cfd,
-                                      SequenceNumber snapshot,
+                                      ColumnFamilyHandleImpl* cfh,
+                                      SuperVersion* sv, SequenceNumber snapshot,
                                       ReadCallback* read_callback,
                                       bool expose_blob_index = false,
                                       bool allow_refresh = true);
@@ -547,7 +699,6 @@ class DBImpl : public DB {
   // depends also on data written to the WAL but not to the memtable.
   SequenceNumber TEST_GetLastVisibleSequence() const;
 
-#ifndef ROCKSDB_LITE
   // Similar to Write() but will call the callback once on the single write
   // thread to determine whether it is safe to perform the write.
   virtual Status WriteWithCallback(const WriteOptions& write_options,
@@ -571,9 +722,15 @@ class DBImpl : public DB {
   // in the memtables, including memtable history.  If cache_only is false,
   // SST files will also be checked.
   //
+  // `key` should NOT have user-defined timestamp appended to user key even if
+  // timestamp is enabled.
+  //
   // If a key is found, *found_record_for_key will be set to true and
   // *seq will be set to the stored sequence number for the latest
-  // operation on this key or kMaxSequenceNumber if unknown.
+  // operation on this key or kMaxSequenceNumber if unknown. If user-defined
+  // timestamp is enabled for this column family and timestamp is not nullptr,
+  // then *timestamp will be set to the stored timestamp for the latest
+  // operation on this key.
   // If no key is found, *found_record_for_key will be set to false.
   //
   // Note: If cache_only=false, it is possible for *seq to be set to 0 if
@@ -597,16 +754,15 @@ class DBImpl : public DB {
   Status GetLatestSequenceForKey(SuperVersion* sv, const Slice& key,
                                  bool cache_only,
                                  SequenceNumber lower_bound_seq,
-                                 SequenceNumber* seq,
+                                 SequenceNumber* seq, std::string* timestamp,
                                  bool* found_record_for_key,
-                                 bool* is_blob_index = nullptr);
+                                 bool* is_blob_index);
 
   Status TraceIteratorSeek(const uint32_t& cf_id, const Slice& key,
                            const Slice& lower_bound, const Slice upper_bound);
   Status TraceIteratorSeekForPrev(const uint32_t& cf_id, const Slice& key,
                                   const Slice& lower_bound,
                                   const Slice upper_bound);
-#endif  // ROCKSDB_LITE
 
   // Similar to GetSnapshot(), but also lets the db know that this snapshot
   // will be used for transaction write-conflict checking.  The DB can then
@@ -621,12 +777,17 @@ class DBImpl : public DB {
   // max_file_num_to_ignore allows bottom level compaction to filter out newly
   // compacted SST files. Setting max_file_num_to_ignore to kMaxUint64 will
   // disable the filtering
+  // If `final_output_level` is not nullptr, it is set to manual compaction's
+  // output level if returned status is OK, and it may or may not be set to
+  // manual compaction's output level if returned status is not OK.
   Status RunManualCompaction(ColumnFamilyData* cfd, int input_level,
                              int output_level,
                              const CompactRangeOptions& compact_range_options,
                              const Slice* begin, const Slice* end,
                              bool exclusive, bool disallow_trivial_move,
-                             uint64_t max_file_num_to_ignore);
+                             uint64_t max_file_num_to_ignore,
+                             const std::string& trim_ts,
+                             int* final_output_level = nullptr);
 
   // Return an internal iterator over the current state of the database.
   // The keys of this iterator are internal keys (see format.h).
@@ -635,12 +796,28 @@ class DBImpl : public DB {
   // the value and so will require PrepareValue() to be called before value();
   // allow_unprepared_value = false is convenient when this optimization is not
   // useful, e.g. when reading the whole column family.
+  //
+  // read_options.ignore_range_deletions determines whether range tombstones are
+  // processed in the returned interator internally, i.e., whether range
+  // tombstone covered keys are in this iterator's output.
   // @param read_options Must outlive the returned iterator.
   InternalIterator* NewInternalIterator(
-      const ReadOptions& read_options, Arena* arena,
-      RangeDelAggregator* range_del_agg, SequenceNumber sequence,
+      const ReadOptions& read_options, Arena* arena, SequenceNumber sequence,
       ColumnFamilyHandle* column_family = nullptr,
       bool allow_unprepared_value = false);
+
+  // Note: to support DB iterator refresh, memtable range tombstones in the
+  // underlying merging iterator needs to be refreshed. If db_iter is not
+  // nullptr, db_iter->SetMemtableRangetombstoneIter() is called with the
+  // memtable range tombstone iterator used by the underlying merging iterator.
+  // This range tombstone iterator can be refreshed later by db_iter.
+  // @param read_options Must outlive the returned iterator.
+  InternalIterator* NewInternalIterator(const ReadOptions& read_options,
+                                        ColumnFamilyData* cfd,
+                                        SuperVersion* super_version,
+                                        Arena* arena, SequenceNumber sequence,
+                                        bool allow_unprepared_value,
+                                        ArenaWrappedDBIter* db_iter = nullptr);
 
   LogsWithPrepTracker* logs_with_prep_tracker() {
     return &logs_with_prep_tracker_;
@@ -671,6 +848,8 @@ class DBImpl : public DB {
   // files pending creation, although it prevents more files than necessary from
   // being deleted.
   uint64_t MinObsoleteSstNumberToKeep();
+
+  uint64_t GetObsoleteSstFilesSize();
 
   // Returns the list of live files in 'live' and the list
   // of all files in the filesystem in 'candidate_files'.
@@ -763,15 +942,6 @@ class DBImpl : public DB {
   }
 
   const WriteController& write_controller() { return write_controller_; }
-
-  // @param read_options Must outlive the returned iterator.
-  InternalIterator* NewInternalIterator(const ReadOptions& read_options,
-                                        ColumnFamilyData* cfd,
-                                        SuperVersion* super_version,
-                                        Arena* arena,
-                                        RangeDelAggregator* range_del_agg,
-                                        SequenceNumber sequence,
-                                        bool allow_unprepared_value);
 
   // hollow transactions shell used for recovery.
   // these will then be passed to TransactionDB so that
@@ -878,6 +1048,7 @@ class DBImpl : public DB {
   }
 
   void AddToLogsToFreeQueue(log::Writer* log_writer) {
+    mutex_.AssertHeld();
     logs_to_free_queue_.push_back(log_writer);
   }
 
@@ -918,33 +1089,24 @@ class DBImpl : public DB {
                        uint64_t* new_time,
                        std::map<std::string, uint64_t>* stats_map);
 
-  // Allow compaction with a set of explicitly specified snapshots
-  virtual Status ExecuteRemoteCompactionRequest(
-      const PluggableCompactionParam& inputParams,
-      PluggableCompactionResult* result, bool sanitize) override;
-
-  // This registered service will be called to do a remote compaction
-  virtual Status RegisterPluggableCompactionService(
-      std::unique_ptr<PluggableCompactionService> rservice) override {
-    mutex_.Lock();
-    remote_compaction_service_ = std::move(rservice);
-    mutex_.Unlock();
-    return Status::OK();
-  }
-
-  // Clearoff any registered pluggable compaction service
-  virtual void UnRegisterPluggableCompactionService() override {
-    mutex_.Lock();
-    remote_compaction_service_ = nullptr;
-    mutex_.Unlock();
-  }
-
   // Print information of all tombstones of all iterators to the std::string
   // This is only used by ldb. The output might be capped. Tombstones
   // printed out are not guaranteed to be in any order.
   Status TablesRangeTombstoneSummary(ColumnFamilyHandle* column_family,
                                      int max_entries_to_print,
                                      std::string* out_str);
+
+  VersionSet* GetVersionSet() const { return versions_.get(); }
+
+  Status WaitForCompact(
+      const WaitForCompactOptions& wait_for_compact_options) override;
+
+  void UpdateReplicationEpoch(uint64_t new_replication_epoch) override;
+  void NewManifestOnNextUpdate() override;
+
+  uint64_t GetNextFileNumber() const override {
+    return versions_->current_next_file_number();
+  }
 
 #ifndef NDEBUG
   // Compact any files in the named level that overlap [*begin, *end]
@@ -973,23 +1135,32 @@ class DBImpl : public DB {
   // is because in certain cases, we can flush column families, wait for the
   // flush to complete, but delete the column family handle before the wait
   // finishes. For example in CompactRange.
-  Status TEST_AtomicFlushMemTables(const autovector<ColumnFamilyData*>& cfds,
-                                   const FlushOptions& flush_opts);
+  Status TEST_AtomicFlushMemTables(
+      const autovector<ColumnFamilyData*>& provided_candidate_cfds,
+      const FlushOptions& flush_opts);
+
+  // Wait for background threads to complete scheduled work.
+  Status TEST_WaitForBackgroundWork();
 
   // Wait for memtable compaction
   Status TEST_WaitForFlushMemTable(ColumnFamilyHandle* column_family = nullptr);
 
-  // Wait for any compaction
-  // We add a bool parameter to wait for unscheduledCompactions_ == 0, but this
-  // is only for the special test of CancelledCompactions
-  Status TEST_WaitForCompact(bool waitUnscheduled = false);
+  Status TEST_WaitForCompact();
+  Status TEST_WaitForCompact(
+      const WaitForCompactOptions& wait_for_compact_options);
+
+  // Wait until all scheduled compactions are done
+  Status TEST_WaitForScheduledCompaction();
+
+  // Wait for any background purge
+  Status TEST_WaitForPurge();
 
   // Get the background error status
   Status TEST_GetBGError();
 
   // Return the maximum overlapping data (in bytes) at next level for any
   // file at a level >= 1.
-  int64_t TEST_MaxNextLevelOverlappingBytes(
+  uint64_t TEST_MaxNextLevelOverlappingBytes(
       ColumnFamilyHandle* column_family = nullptr);
 
   // Return the current manifest file no.
@@ -1001,12 +1172,18 @@ class DBImpl : public DB {
   // get total level0 file size. Only for testing.
   uint64_t TEST_GetLevel0TotalSize();
 
-  void TEST_GetFilesMetaData(ColumnFamilyHandle* column_family,
-                             std::vector<std::vector<FileMetaData>>* metadata);
+  void TEST_GetFilesMetaData(
+      ColumnFamilyHandle* column_family,
+      std::vector<std::vector<FileMetaData>>* metadata,
+      std::vector<std::shared_ptr<BlobFileMetaData>>* blob_metadata = nullptr);
 
   void TEST_LockMutex();
 
   void TEST_UnlockMutex();
+
+  InstrumentedMutex* TEST_Mutex() { return &mutex_; }
+
+  void TEST_SignalAllBgCv();
 
   // REQUIRES: mutex locked
   void* TEST_BeginWrite();
@@ -1045,10 +1222,10 @@ class DBImpl : public DB {
   int TEST_BGCompactionsAllowed() const;
   int TEST_BGFlushesAllowed() const;
   size_t TEST_GetWalPreallocateBlockSize(uint64_t write_buffer_size) const;
-  void TEST_WaitForStatsDumpRun(std::function<void()> callback) const;
+  void TEST_WaitForPeriodicTaskRun(std::function<void()> callback) const;
+  SeqnoToTimeMapping TEST_GetSeqnoToTimeMapping() const;
+  const autovector<uint64_t>& TEST_GetFilesToQuarantine() const;
   size_t TEST_EstimateInMemoryStatsHistorySize() const;
-
-  VersionSet* TEST_GetVersionSet() const { return versions_.get(); }
 
   uint64_t TEST_GetCurrentLogNumber() const {
     InstrumentedMutexLock l(mutex());
@@ -1060,9 +1237,11 @@ class DBImpl : public DB {
     return files_grabbed_for_purge_;
   }
 
-#ifndef ROCKSDB_LITE
-  PeriodicWorkTestScheduler* TEST_GetPeriodicWorkScheduler() const;
-#endif  // !ROCKSDB_LITE
+  const PeriodicTaskScheduler& TEST_GetPeriodicTaskScheduler() const;
+
+  static Status TEST_ValidateOptions(const DBOptions& db_options) {
+    return ValidateOptions(db_options);
+  }
 
 #endif  // NDEBUG
 
@@ -1074,6 +1253,28 @@ class DBImpl : public DB {
 
   // flush LOG out of application buffer
   void FlushInfoLog();
+
+  // record current sequence number to time mapping. If
+  // populate_historical_seconds > 0 then pre-populate all the
+  // sequence numbers from [1, last] to map to [now minus
+  // populate_historical_seconds, now].
+  void RecordSeqnoToTimeMapping(uint64_t populate_historical_seconds);
+
+  // Everytime DB's seqno to time mapping changed (which already hold the db
+  // mutex), we install a new SuperVersion in each column family with a shared
+  // copy of the new mapping while holding the db mutex.
+  // This is done for all column families even though the column family does not
+  // explicitly enabled the
+  // `preclude_last_level_data_seconds` or `preserve_internal_time_seconds`
+  // features.
+  // This mapping supports iterators to fulfill the
+  // "rocksdb.iterator.write-time" iterator property for entries in memtables.
+  //
+  // Since this new SuperVersion doesn't involve an LSM tree shape change, we
+  // don't schedule work after installing this SuperVersion. It returns the used
+  // `SuperVersionContext` for clean up after release mutex.
+  void InstallSeqnoToTimeMappingInSV(
+      std::vector<SuperVersionContext>* sv_contexts);
 
   // Interface to block and signal the DB in case of stalling writes by
   // WriteBufferManager. Each DBImpl object contains ptr to WBMStallInterface.
@@ -1110,8 +1311,10 @@ class DBImpl : public DB {
     // Called from WriteBufferManager. This function changes the state_
     // to State::RUNNING indicating the stall is cleared and DB can proceed.
     void Signal() override {
-      MutexLock lock(&state_mutex_);
-      state_ = State::RUNNING;
+      {
+        MutexLock lock(&state_mutex_);
+        state_ = State::RUNNING;
+      }
       state_cv_.Signal();
     }
 
@@ -1125,8 +1328,14 @@ class DBImpl : public DB {
     State state_;
   };
 
+  static void TEST_ResetDbSessionIdGen();
+  static std::string GenerateDbSessionId(Env* env);
+
+  bool seq_per_batch() const { return seq_per_batch_; }
+
  protected:
   const std::string dbname_;
+  // TODO(peterd): unify with VersionSet::db_id_
   std::string db_id_;
   // db_session_id_ is an identifier that gets reset
   // every time the DB is opened
@@ -1134,6 +1343,7 @@ class DBImpl : public DB {
   std::unique_ptr<VersionSet> versions_;
   // Flag to check whether we allocated and own the info log file
   bool own_info_log_;
+  Status init_logger_creation_s_;
   const DBOptions initial_db_options_;
   Env* const env_;
   std::shared_ptr<IOTracer> io_tracer_;
@@ -1147,12 +1357,18 @@ class DBImpl : public DB {
   InstrumentedMutex trace_mutex_;
   BlockCacheTracer block_cache_tracer_;
 
+  // constant false canceled flag, used when the compaction is not manual
+  const std::atomic<bool> kManualCompactionCanceledFalse_{false};
+
   // State below is protected by mutex_
   // With two_write_queues enabled, some of the variables that accessed during
   // WriteToWAL need different synchronization: log_empty_, alive_log_files_,
   // logs_, logfile_number_. Refer to the definition of each variable below for
   // more description.
-  mutable InstrumentedMutex mutex_;
+  //
+  // `mutex_` can be a hot lock in some workloads, so it deserves dedicated
+  // cachelines.
+  mutable CacheAlignedInstrumentedMutex mutex_;
 
   ColumnFamilyHandleImpl* default_cf_handle_;
   InternalStats* default_cf_internal_stats_;
@@ -1167,10 +1383,7 @@ class DBImpl : public DB {
 
   // only used for dynamically adjusting max_total_wal_size. it is a sum of
   // [write_buffer_size * max_write_buffer_number] over all column families
-  uint64_t max_total_in_memory_state_;
-  // If true, we have only one (default) column family. We use this to optimize
-  // some code-paths
-  bool single_column_family_mode_;
+  std::atomic<uint64_t> max_total_in_memory_state_;
 
   // The options to access storage files
   const FileOptions file_options_;
@@ -1201,20 +1414,55 @@ class DBImpl : public DB {
 
   std::atomic<bool> shutting_down_;
 
-  // Except in DB::Open(), WriteOptionsFile can only be called when:
-  // Persist options to options file.
-  // If need_mutex_lock = false, the method will lock DB mutex.
-  // If need_enter_write_thread = false, the method will enter write thread.
-  Status WriteOptionsFile(bool need_mutex_lock, bool need_enter_write_thread);
+  // No new background jobs can be queued if true. This is used to prevent new
+  // background jobs from being queued after WaitForCompact() completes waiting
+  // all background jobs then attempts to close when close_db_ option is true.
+  bool reject_new_background_jobs_;
+
+  // RecoveryContext struct stores the context about version edits along
+  // with corresponding column_family_data and column_family_options.
+  class RecoveryContext {
+   public:
+    ~RecoveryContext() {
+      for (auto& edit_list : edit_lists_) {
+        for (auto* edit : edit_list) {
+          delete edit;
+        }
+      }
+    }
+
+    void UpdateVersionEdits(ColumnFamilyData* cfd, const VersionEdit& edit) {
+      assert(cfd != nullptr);
+      if (map_.find(cfd->GetID()) == map_.end()) {
+        uint32_t size = static_cast<uint32_t>(map_.size());
+        map_.emplace(cfd->GetID(), size);
+        cfds_.emplace_back(cfd);
+        mutable_cf_opts_.emplace_back(cfd->GetLatestMutableCFOptions());
+        edit_lists_.emplace_back(autovector<VersionEdit*>());
+      }
+      uint32_t i = map_[cfd->GetID()];
+      edit_lists_[i].emplace_back(new VersionEdit(edit));
+    }
+
+    std::unordered_map<uint32_t, uint32_t> map_;  // cf_id to index;
+    autovector<ColumnFamilyData*> cfds_;
+    autovector<const MutableCFOptions*> mutable_cf_opts_;
+    autovector<autovector<VersionEdit*>> edit_lists_;
+    // Stale SST files to delete found upon recovery. This stores a mapping from
+    // such a file's absolute path to its parent directory.
+    std::unordered_map<std::string, std::string> files_to_delete_;
+    bool is_new_db_ = false;
+  };
+
+  // Persist options to options file. Must be holding options_mutex_.
+  // Will lock DB mutex if !db_mutex_already_held.
+  Status WriteOptionsFile(const WriteOptions& write_options,
+                          bool db_mutex_already_held);
 
   Status CompactRangeInternal(const CompactRangeOptions& options,
                               ColumnFamilyHandle* column_family,
-                              const Slice* begin, const Slice* end);
-
-  Status GetApproximateSizesInternal(const SizeApproximationOptions& options,
-                                     ColumnFamilyHandle* column_family,
-                                     const Range* range, int n,
-                                     uint64_t* sizes);
+                              const Slice* begin, const Slice* end,
+                              const std::string& trim_ts);
 
   // The following two functions can only be called when:
   // 1. WriteThread::Writer::EnterUnbatched() is used.
@@ -1224,7 +1472,7 @@ class DBImpl : public DB {
 
   void NotifyOnFlushBegin(ColumnFamilyData* cfd, FileMetaData* file_meta,
                           const MutableCFOptions& mutable_cf_options,
-                          int job_id);
+                          int job_id, FlushReason flush_reason);
 
   void NotifyOnFlushCompleted(
       ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
@@ -1241,10 +1489,13 @@ class DBImpl : public DB {
   void NotifyOnMemTableSealed(ColumnFamilyData* cfd,
                               const MemTableInfo& mem_table_info);
 
-#ifndef ROCKSDB_LITE
   void NotifyOnExternalFileIngested(
       ColumnFamilyData* cfd, const ExternalSstFileIngestionJob& ingestion_job);
-#endif  // !ROCKSDB_LITE
+
+  Status FlushAllColumnFamilies(const FlushOptions& flush_options,
+                                FlushReason flush_reason);
+
+  virtual Status FlushForGetLiveFiles();
 
   void NewThreadStatusCfInfo(ColumnFamilyData* cfd) const;
 
@@ -1272,7 +1523,8 @@ class DBImpl : public DB {
                    uint64_t* log_used = nullptr, uint64_t log_ref = 0,
                    bool disable_memtable = false, uint64_t* seq_used = nullptr,
                    size_t batch_cnt = 0,
-                   PreReleaseCallback* pre_release_callback = nullptr);
+                   PreReleaseCallback* pre_release_callback = nullptr,
+                   PostMemTableCallback* post_memtable_callback = nullptr);
 
   Status PipelinedWriteImpl(const WriteOptions& options, WriteBatch* updates,
                             WriteCallback* callback = nullptr,
@@ -1319,16 +1571,22 @@ class DBImpl : public DB {
   // be made to the descriptor are added to *edit.
   // recovered_seq is set to less than kMaxSequenceNumber if the log's tail is
   // skipped.
+  // recovery_ctx stores the context about version edits and all those
+  // edits are persisted to new Manifest after successfully syncing the new WAL.
   virtual Status Recover(
       const std::vector<ColumnFamilyDescriptor>& column_families,
       bool read_only = false, bool error_if_wal_file_exists = false,
       bool error_if_data_exists_in_wals = false,
-      uint64_t* recovered_seq = nullptr);
+      uint64_t* recovered_seq = nullptr,
+      RecoveryContext* recovery_ctx = nullptr);
 
   virtual bool OwnTablesAndLogs() const { return true; }
 
-  // Set DB identity file, and write DB ID to manifest if necessary.
-  Status SetDBId(bool read_only);
+  // Setup DB identity file, and write DB ID to manifest if necessary.
+  Status SetupDBId(const WriteOptions& write_options, bool read_only,
+                   RecoveryContext* recovery_ctx);
+  // Assign db_id_ and write DB ID to manifest if necessary.
+  void SetDBId(std::string&& id, bool read_only, RecoveryContext* recovery_ctx);
 
   // REQUIRES: db mutex held when calling this function, but the db mutex can
   // be released and re-acquired. Db mutex will be held when the function
@@ -1337,16 +1595,51 @@ class DBImpl : public DB {
   // not referenced in the MANIFEST (e.g.
   // 1. It's best effort recovery;
   // 2. The VersionEdits referencing the SST files are appended to
-  // MANIFEST, DB crashes when syncing the MANIFEST, the VersionEdits are
+  // RecoveryContext, DB crashes when syncing the MANIFEST, the VersionEdits are
   // still not synced to MANIFEST during recovery.)
-  // We delete these SST files. In the
+  // It stores the SST files to be deleted in RecoveryContext. In the
   // meantime, we find out the largest file number present in the paths, and
   // bump up the version set's next_file_number_ to be 1 + largest_file_number.
-  Status DeleteUnreferencedSstFiles();
+  // recovery_ctx stores the context about version edits and files to be
+  // deleted. All those edits are persisted to new Manifest after successfully
+  // syncing the new WAL.
+  Status DeleteUnreferencedSstFiles(RecoveryContext* recovery_ctx);
 
   // SetDbSessionId() should be called in the constuctor DBImpl()
   // to ensure that db_session_id_ gets updated every time the DB is opened
   void SetDbSessionId();
+
+  Status FailIfCfHasTs(const ColumnFamilyHandle* column_family) const;
+  Status FailIfTsMismatchCf(ColumnFamilyHandle* column_family,
+                            const Slice& ts) const;
+
+  // Check that the read timestamp `ts` is at or above the `full_history_ts_low`
+  // timestamp in a `SuperVersion`. It's necessary to do this check after
+  // grabbing the SuperVersion. If the check passed, the referenced SuperVersion
+  // this read holds on to can ensure the read won't be affected if
+  // `full_history_ts_low` is increased concurrently, and this achieves that
+  // without explicitly locking by piggybacking the SuperVersion.
+  Status FailIfReadCollapsedHistory(const ColumnFamilyData* cfd,
+                                    const SuperVersion* sv,
+                                    const Slice& ts) const;
+
+  // recovery_ctx stores the context about version edits and
+  // LogAndApplyForRecovery persist all those edits to new Manifest after
+  // successfully syncing new WAL.
+  // LogAndApplyForRecovery should be called only once during recovery and it
+  // should be called when RocksDB writes to a first new MANIFEST since this
+  // recovery.
+  Status LogAndApplyForRecovery(const RecoveryContext& recovery_ctx);
+
+  void InvokeWalFilterIfNeededOnColumnFamilyToWalNumberMap();
+
+  // Return true to proceed with current WAL record whose content is stored in
+  // `batch`. Return false to skip current WAL record.
+  bool InvokeWalFilterIfNeededOnWalRecord(uint64_t wal_number,
+                                          const std::string& wal_fname,
+                                          log::Reader::Reporter& reporter,
+                                          Status& status, bool& stop_replay,
+                                          WriteBatch& batch);
 
  private:
   friend class DB;
@@ -1361,17 +1654,17 @@ class DBImpl : public DB {
   friend class WriteUnpreparedTxnDB;
   friend class WriteUnpreparedTxn;
 
-#ifndef ROCKSDB_LITE
   friend class ForwardIterator;
-#endif
   friend struct SuperVersion;
   friend class CompactedDBImpl;
+#ifndef NDEBUG
   friend class DBTest_ConcurrentFlushWAL_Test;
   friend class DBTest_MixedSlowdownOptionsStop_Test;
   friend class DBCompactionTest_CompactBottomLevelFilesWithDeletions_Test;
   friend class DBCompactionTest_CompactionDuringShutdown_Test;
+  friend class DBCompactionTest_DelayCompactBottomLevelFilesWithDeletions_Test;
+  friend class DBCompactionTest_DisableCompactBottomLevelFiles_Test;
   friend class StatsHistoryTest_PersistentStatsCreateColumnFamilies_Test;
-#ifndef NDEBUG
   friend class DBTest2_ReadCallbackTest_Test;
   friend class WriteCallbackPTest_WriteWithCallbackTest_Test;
   friend class XFTransactionWriteHandler;
@@ -1418,18 +1711,54 @@ class DBImpl : public DB {
       return w;
     }
     Status ClearWriter() {
-      Status s = writer->WriteBuffer();
+      // TODO: plumb Env::IOActivity, Env::IOPriority
+      Status s = writer->WriteBuffer(WriteOptions());
       delete writer;
       writer = nullptr;
       return s;
+    }
+
+    bool IsSyncing() { return getting_synced; }
+
+    uint64_t GetPreSyncSize() {
+      assert(getting_synced);
+      return pre_sync_size;
+    }
+
+    void PrepareForSync() {
+      assert(!getting_synced);
+      // Size is expected to be monotonically increasing.
+      assert(writer->file()->GetFlushedSize() >= pre_sync_size);
+      getting_synced = true;
+      pre_sync_size = writer->file()->GetFlushedSize();
+    }
+
+    void FinishSync() {
+      assert(getting_synced);
+      getting_synced = false;
     }
 
     uint64_t number;
     // Visual Studio doesn't support deque's member to be noncopyable because
     // of a std::unique_ptr as a member.
     log::Writer* writer;  // own
+
+   private:
     // true for some prefix of logs_
     bool getting_synced = false;
+    // The size of the file before the sync happens. This amount is guaranteed
+    // to be persisted even if appends happen during sync so it can be used for
+    // tracking the synced size in MANIFEST.
+    uint64_t pre_sync_size = 0;
+  };
+
+  struct LogContext {
+    explicit LogContext(bool need_sync = false)
+        : need_log_sync(need_sync), need_log_dir_sync(need_sync) {}
+    bool need_log_sync = false;
+    bool need_log_dir_sync = false;
+    log::Writer* writer = nullptr;
+    LogFileNumberSize* log_file_number_size = nullptr;
   };
 
   // PurgeFileInfo is a structure to hold information of files to be deleted in
@@ -1448,12 +1777,17 @@ class DBImpl : public DB {
   // Argument required by background flush thread.
   struct BGFlushArg {
     BGFlushArg()
-        : cfd_(nullptr), max_memtable_id_(0), superversion_context_(nullptr) {}
+        : cfd_(nullptr),
+          max_memtable_id_(0),
+          superversion_context_(nullptr),
+          flush_reason_(FlushReason::kOthers) {}
     BGFlushArg(ColumnFamilyData* cfd, uint64_t max_memtable_id,
-               SuperVersionContext* superversion_context)
+               SuperVersionContext* superversion_context,
+               FlushReason flush_reason)
         : cfd_(cfd),
           max_memtable_id_(max_memtable_id),
-          superversion_context_(superversion_context) {}
+          superversion_context_(superversion_context),
+          flush_reason_(flush_reason) {}
 
     // Column family to flush.
     ColumnFamilyData* cfd_;
@@ -1464,6 +1798,7 @@ class DBImpl : public DB {
     // installs a new superversion for the column family. This operation
     // requires a SuperVersionContext object (currently embedded in JobContext).
     SuperVersionContext* superversion_context_;
+    FlushReason flush_reason_;
   };
 
   // Argument passed to flush thread.
@@ -1475,22 +1810,43 @@ class DBImpl : public DB {
 
   // Information for a manual compaction
   struct ManualCompactionState {
+    ManualCompactionState(ColumnFamilyData* _cfd, int _input_level,
+                          int _output_level, uint32_t _output_path_id,
+                          bool _exclusive, bool _disallow_trivial_move,
+                          std::atomic<bool>* _canceled)
+        : cfd(_cfd),
+          input_level(_input_level),
+          output_level(_output_level),
+          output_path_id(_output_path_id),
+          exclusive(_exclusive),
+          disallow_trivial_move(_disallow_trivial_move),
+          canceled(_canceled ? *_canceled : canceled_internal_storage) {}
+    // When _canceled is not provided by ther user, we assign the reference of
+    // canceled_internal_storage to it to consolidate canceled and
+    // manual_compaction_paused since DisableManualCompaction() might be
+    // called
+
     ColumnFamilyData* cfd;
     int input_level;
     int output_level;
     uint32_t output_path_id;
     Status status;
-    bool done;
-    bool in_progress;             // compaction request being processed?
-    bool incomplete;              // only part of requested range compacted
-    bool exclusive;               // current behavior of only one manual
-    bool disallow_trivial_move;   // Force actual compaction to run
-    const InternalKey* begin;     // nullptr means beginning of key range
-    const InternalKey* end;       // nullptr means end of key range
-    InternalKey* manual_end;      // how far we are compacting
+    bool done = false;
+    bool in_progress = false;    // compaction request being processed?
+    bool incomplete = false;     // only part of requested range compacted
+    bool exclusive;              // current behavior of only one manual
+    bool disallow_trivial_move;  // Force actual compaction to run
+    const InternalKey* begin = nullptr;  // nullptr means beginning of key range
+    const InternalKey* end = nullptr;    // nullptr means end of key range
+    InternalKey* manual_end = nullptr;   // how far we are compacting
     InternalKey tmp_storage;      // Used to keep track of compaction progress
     InternalKey tmp_storage1;     // Used to keep track of compaction progress
-    std::atomic<bool>* canceled;  // Compaction canceled by the user?
+
+    // When the user provides a canceled pointer in CompactRangeOptions, the
+    // above varaibe is the reference of the user-provided
+    // `canceled`, otherwise, it is the reference of canceled_internal_storage
+    std::atomic<bool> canceled_internal_storage = false;
+    std::atomic<bool>& canceled;  // Compaction canceled pointer reference
   };
   struct PrepickedCompaction {
     // background compaction takes ownership of `compaction`.
@@ -1531,9 +1887,17 @@ class DBImpl : public DB {
 
   const Status CreateArchivalDirectory();
 
-  Status CreateColumnFamilyImpl(const ColumnFamilyOptions& cf_options,
+  // Create a column family, without some of the follow-up work yet
+  Status CreateColumnFamilyImpl(const ReadOptions& read_options,
+                                const WriteOptions& write_options,
+                                const ColumnFamilyOptions& cf_options,
                                 const std::string& cf_name,
                                 ColumnFamilyHandle** handle);
+
+  // Follow-up work to user creating a column family or (families)
+  Status WrapUpCreateColumnFamilies(
+      const ReadOptions& read_options, const WriteOptions& write_options,
+      const std::vector<const ColumnFamilyOptions*>& cf_options);
 
   Status DropColumnFamilyImpl(ColumnFamilyHandle* column_family);
 
@@ -1564,14 +1928,16 @@ class DBImpl : public DB {
   void ReleaseFileNumberFromPendingOutputs(
       std::unique_ptr<std::list<uint64_t>::iterator>& v);
 
-  IOStatus SyncClosedLogs(JobContext* job_context);
+  IOStatus SyncClosedLogs(const WriteOptions& write_options,
+                          JobContext* job_context, VersionEdit* synced_wals,
+                          bool error_recovery_in_prog);
 
   // Flush the in-memory write buffer to storage.  Switches to a new
   // log-file/memtable and writes a new descriptor iff successful. Then
   // installs a new super version for the column family.
   Status FlushMemTableToOutputFile(
       ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
-      bool* madeProgress, JobContext* job_context,
+      bool* madeProgress, JobContext* job_context, FlushReason flush_reason,
       SuperVersionContext* superversion_context,
       std::vector<SequenceNumber>& snapshot_seqs,
       SequenceNumber earliest_write_conflict_snapshot,
@@ -1592,7 +1958,8 @@ class DBImpl : public DB {
   // corrupted_log_found is set to true if we recover from a corrupted log file.
   Status RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
                          SequenceNumber* next_sequence, bool read_only,
-                         bool* corrupted_log_found);
+                         bool* corrupted_log_found,
+                         RecoveryContext* recovery_ctx);
 
   // The following two methods are used to flush a memtable to
   // storage. The first one is used at database RecoveryTime (when the
@@ -1616,7 +1983,8 @@ class DBImpl : public DB {
 
   // num_bytes: for slowdown case, delay time is calculated based on
   //            `num_bytes` going through.
-  Status DelayWrite(uint64_t num_bytes, const WriteOptions& write_options);
+  Status DelayWrite(uint64_t num_bytes, WriteThread& write_thread,
+                    const WriteOptions& write_options);
 
   // Begin stalling of writes when memory usage increases beyond a certain
   // threshold.
@@ -1632,18 +2000,48 @@ class DBImpl : public DB {
 
   Status TrimMemtableHistory(WriteContext* context);
 
+  // Switch memtable without creating new WAL. Also set the next_log_num and
+  // replication_sequence in switched memtable
+  //
+  // NOTE:
+  // - this function should only be used when WAL is disabled.
+  // - Unlike `SwitchMemtable`, the dbmutex will be held throughput the function
+  // call, unless there is listener on `OnMemTableSealed` event
+  //
+  // REQUIRES: mutex_ is held
+  // REQUIRES: this thread is currently at the front of the writer queue
+  // REQUIRES: this thread is currently at the front of the 2nd writer queue if
+  // two_write_queues_ is true (This is to simplify the reasoning.)
+  Status SwitchMemtableWithoutCreatingWAL(
+      ColumnFamilyData* cfd, WriteContext* context, uint64_t next_log_num,
+      const std::string& replication_sequence);
+
   Status SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context);
 
-  void SelectColumnFamiliesForAtomicFlush(autovector<ColumnFamilyData*>* cfds);
+  // Select and output column families qualified for atomic flush in
+  // `selected_cfds`. If `provided_candidate_cfds` is non-empty, it will be used
+  // as candidate CFs to select qualified ones from. Otherwise, all column
+  // families are used as candidate to select from.
+  //
+  // REQUIRES: mutex held
+  void SelectColumnFamiliesForAtomicFlush(
+      autovector<ColumnFamilyData*>* selected_cfds,
+      const autovector<ColumnFamilyData*>& provided_candidate_cfds = {});
 
   // Force current memtable contents to be flushed.
   Status FlushMemTable(ColumnFamilyData* cfd, const FlushOptions& options,
-                       FlushReason flush_reason, bool writes_stopped = false);
+                       FlushReason flush_reason,
+                       bool entered_write_thread = false);
 
+  // Atomic-flush memtables from quanlified CFs among `provided_candidate_cfds`
+  // (if non-empty) or amomg all column families and atomically record the
+  // result to the MANIFEST.
   Status AtomicFlushMemTables(
-      const autovector<ColumnFamilyData*>& column_family_datas,
       const FlushOptions& options, FlushReason flush_reason,
-      bool writes_stopped = false);
+      const autovector<ColumnFamilyData*>& provided_candidate_cfds = {},
+      bool entered_write_thread = false);
+
+  Status RetryFlushesForErrorRecovery(FlushReason flush_reason, bool wait);
 
   // Wait until flushing this column family won't stall writes
   Status WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
@@ -1694,6 +2092,25 @@ class DBImpl : public DB {
     }
   }
 
+  // TaskType is used to identify tasks in thread-pool, currently only
+  // differentiate manual compaction, which could be unscheduled from the
+  // thread-pool.
+  enum class TaskType : uint8_t {
+    kDefault = 0,
+    kManualCompaction = 1,
+    kCount = 2,
+  };
+
+  // Task tag is used to identity tasks in thread-pool, which is
+  // dbImpl obj address + type
+  inline void* GetTaskTag(TaskType type) {
+    return GetTaskTag(static_cast<uint8_t>(type));
+  }
+
+  inline void* GetTaskTag(uint8_t type) {
+    return static_cast<uint8_t*>(static_cast<void*>(this)) + type;
+  }
+
   // REQUIRES: mutex locked and in write thread.
   void AssignAtomicFlushSeq(const autovector<ColumnFamilyData*>& cfds);
 
@@ -1704,20 +2121,27 @@ class DBImpl : public DB {
   Status HandleWriteBufferManagerFlush(WriteContext* write_context);
 
   // REQUIRES: mutex locked
-  Status PreprocessWrite(const WriteOptions& write_options, bool* need_log_sync,
-                         WriteContext* write_context);
+  Status PreprocessWrite(const WriteOptions& write_options,
+                         LogContext* log_context, WriteContext* write_context);
 
-  WriteBatch* MergeBatch(const WriteThread::WriteGroup& write_group,
-                         WriteBatch* tmp_batch, size_t* write_with_wal,
-                         WriteBatch** to_be_cached_state);
+  // Merge write batches in the write group into merged_batch.
+  // Returns OK if merge is successful.
+  // Returns Corruption if corruption in write batch is detected.
+  Status MergeBatch(const WriteThread::WriteGroup& write_group,
+                    WriteBatch* tmp_batch, WriteBatch** merged_batch,
+                    size_t* write_with_wal, WriteBatch** to_be_cached_state);
 
-  IOStatus WriteToWAL(const WriteBatch& merged_batch, log::Writer* log_writer,
-                      uint64_t* log_used, uint64_t* log_size);
+  IOStatus WriteToWAL(const WriteBatch& merged_batch,
+                      const WriteOptions& write_options,
+                      log::Writer* log_writer, uint64_t* log_used,
+                      uint64_t* log_size,
+                      LogFileNumberSize& log_file_number_size);
 
   IOStatus WriteToWAL(const WriteThread::WriteGroup& write_group,
                       log::Writer* log_writer, uint64_t* log_used,
                       bool need_log_sync, bool need_log_dir_sync,
-                      SequenceNumber sequence);
+                      SequenceNumber sequence,
+                      LogFileNumberSize& log_file_number_size);
 
   IOStatus ConcurrentWriteToWAL(const WriteThread::WriteGroup& write_group,
                                 uint64_t* log_used,
@@ -1737,8 +2161,6 @@ class DBImpl : public DB {
   // Used by WriteImpl to update bg_error_ in case of memtable insert error.
   void MemTableInsertStatusCheck(const Status& memtable_insert_status);
 
-#ifndef ROCKSDB_LITE
-
   Status CompactFilesImpl(const CompactionOptions& compact_options,
                           ColumnFamilyData* cfd, Version* version,
                           const std::vector<std::string>& input_file_names,
@@ -1747,32 +2169,36 @@ class DBImpl : public DB {
                           JobContext* job_context, LogBuffer* log_buffer,
                           CompactionJobInfo* compaction_job_info);
 
-  // Wait for current IngestExternalFile() calls to finish.
-  // REQUIRES: mutex_ held
-  void WaitForIngestFile();
-
-#else
-  // IngestExternalFile is not supported in ROCKSDB_LITE so this function
-  // will be no-op
-  void WaitForIngestFile() {}
-#endif  // ROCKSDB_LITE
-
   ColumnFamilyData* GetColumnFamilyDataByName(const std::string& cf_name);
 
   void MaybeScheduleFlushOrCompaction();
 
-  // A flush request specifies the column families to flush as well as the
-  // largest memtable id to persist for each column family. Once all the
-  // memtables whose IDs are smaller than or equal to this per-column-family
-  // specified value, this flush request is considered to have completed its
-  // work of flushing this column family. After completing the work for all
-  // column families in this request, this flush is considered complete.
-  typedef std::vector<std::pair<ColumnFamilyData*, uint64_t>> FlushRequest;
+  struct FlushRequest {
+    FlushReason flush_reason;
+    // A map from column family to flush to largest memtable id to persist for
+    // each column family. Once all the memtables whose IDs are smaller than or
+    // equal to this per-column-family specified value, this flush request is
+    // considered to have completed its work of flushing this column family.
+    // After completing the work for all column families in this request, this
+    // flush is considered complete.
+    std::unordered_map<ColumnFamilyData*, uint64_t>
+        cfd_to_max_mem_id_to_persist;
 
+#ifndef NDEBUG
+    int reschedule_count = 1;
+#endif /* !NDEBUG */
+  };
+
+  // In case of atomic flush, generates a `FlushRequest` for the latest atomic
+  // cuts for these `cfds`. Atomic cuts are recorded in
+  // `AssignAtomicFlushSeq()`. For each entry in `cfds`, all CFDs sharing the
+  // same latest atomic cut must also be present.
+  //
+  // REQUIRES: mutex held
   void GenerateFlushRequest(const autovector<ColumnFamilyData*>& cfds,
-                            FlushRequest* req);
+                            FlushReason flush_reason, FlushRequest* req);
 
-  void SchedulePendingFlush(const FlushRequest& req, FlushReason flush_reason);
+  void SchedulePendingFlush(const FlushRequest& req);
 
   void SchedulePendingCompaction(ColumnFamilyData* cfd);
   void SchedulePendingPurge(std::string fname, std::string dir_to_sync,
@@ -1795,6 +2221,7 @@ class DBImpl : public DB {
                               Env::Priority thread_pri);
   Status BackgroundFlush(bool* madeProgress, JobContext* job_context,
                          LogBuffer* log_buffer, FlushReason* reason,
+                         bool* flush_rescheduled_to_retain_udt,
                          Env::Priority thread_pri);
 
   bool EnoughRoomForCompaction(ColumnFamilyData* cfd,
@@ -1807,8 +2234,21 @@ class DBImpl : public DB {
                               std::unique_ptr<TaskLimiterToken>* token,
                               LogBuffer* log_buffer);
 
+  // Return true if the `FlushRequest` can be rescheduled to retain the UDT.
+  // Only true if there are user-defined timestamps in the involved MemTables
+  // with newer than cutoff timestamp `full_history_ts_low` and not flushing
+  // immediately will not cause entering write stall mode.
+  bool ShouldRescheduleFlushRequestToRetainUDT(const FlushRequest& flush_req);
+
   // Schedule background tasks
-  void StartPeriodicWorkScheduler();
+  Status StartPeriodicTaskScheduler();
+
+  // Cancel scheduled periodic tasks
+  Status CancelPeriodicTaskScheduler();
+
+  Status RegisterRecordSeqnoTimeWorker(const ReadOptions& read_options,
+                                       const WriteOptions& write_options,
+                                       bool is_new_db);
 
   void PrintStatistics();
 
@@ -1835,16 +2275,33 @@ class DBImpl : public DB {
       std::unique_ptr<TaskLimiterToken>* token, LogBuffer* log_buffer);
 
   // helper function to call after some of the logs_ were synced
-  Status MarkLogsSynced(uint64_t up_to, bool synced_dir);
+  void MarkLogsSynced(uint64_t up_to, bool synced_dir, VersionEdit* edit);
+  Status ApplyWALToManifest(const ReadOptions& read_options,
+                            const WriteOptions& write_options,
+                            VersionEdit* edit);
   // WALs with log number up to up_to are not synced successfully.
   void MarkLogsNotSynced(uint64_t up_to);
 
   SnapshotImpl* GetSnapshotImpl(bool is_write_conflict_boundary,
                                 bool lock = true);
 
+  // If snapshot_seq != kMaxSequenceNumber, then this function can only be
+  // called from the write thread that publishes sequence numbers to readers.
+  // For 1) write-committed, or 2) write-prepared + one-write-queue, this will
+  // be the write thread performing memtable writes. For write-prepared with
+  // two write queues, this will be the write thread writing commit marker to
+  // the WAL.
+  // If snapshot_seq == kMaxSequenceNumber, this function is called by a caller
+  // ensuring no writes to the database.
+  std::pair<Status, std::shared_ptr<const SnapshotImpl>>
+  CreateTimestampedSnapshotImpl(SequenceNumber snapshot_seq, uint64_t ts,
+                                bool lock = true);
+
   uint64_t GetMaxTotalWalSize() const;
 
   FSDirectory* GetDataDir(ColumnFamilyData* cfd, size_t path_id) const;
+
+  Status MaybeReleaseTimestampedSnapshotsAndCheck();
 
   Status CloseHelper();
 
@@ -1873,11 +2330,11 @@ class DBImpl : public DB {
   bool ShouldntRunManualCompaction(ManualCompactionState* m);
   bool HaveManualCompaction(ColumnFamilyData* cfd);
   bool MCOverlap(ManualCompactionState* m, ManualCompactionState* m1);
-#ifndef ROCKSDB_LITE
+  void UpdateDeletionCompactionStats(const std::unique_ptr<Compaction>& c);
   void BuildCompactionJobInfo(const ColumnFamilyData* cfd, Compaction* c,
                               const Status& st,
                               const CompactionJobStats& compaction_job_stats,
-                              const int job_id, const Version* current,
+                              const int job_id,
                               CompactionJobInfo* compaction_job_info) const;
   // Reserve the next 'num' file numbers for to-be-ingested external SST files,
   // and return the current file_number in 'next_file_number'.
@@ -1886,7 +2343,6 @@ class DBImpl : public DB {
       ColumnFamilyData* cfd, uint64_t num,
       std::unique_ptr<std::list<uint64_t>::iterator>& pending_output_elem,
       uint64_t* next_file_number);
-#endif  //! ROCKSDB_LITE
 
   bool ShouldPurge(uint64_t file_number) const;
   void MarkAsGrabbedForPurge(uint64_t file_number);
@@ -1894,8 +2350,9 @@ class DBImpl : public DB {
   size_t GetWalPreallocateBlockSize(uint64_t write_buffer_size) const;
   Env::WriteLifeTimeHint CalculateWALWriteHint() { return Env::WLTH_SHORT; }
 
-  IOStatus CreateWAL(uint64_t log_file_num, uint64_t recycle_log_number,
-                     size_t preallocate_block_size, log::Writer** new_log);
+  IOStatus CreateWAL(const WriteOptions& write_options, uint64_t log_file_num,
+                     uint64_t recycle_log_number, size_t preallocate_block_size,
+                     log::Writer** new_log);
 
   // Validate self-consistency of DB options
   static Status ValidateOptions(const DBOptions& db_options);
@@ -1909,6 +2366,18 @@ class DBImpl : public DB {
   void PrepareMultiGetKeys(
       const size_t num_keys, bool sorted,
       autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* key_ptrs);
+
+  void MultiGetCommon(const ReadOptions& options,
+                      ColumnFamilyHandle* column_family, const size_t num_keys,
+                      const Slice* keys, PinnableSlice* values,
+                      PinnableWideColumns* columns, std::string* timestamps,
+                      Status* statuses, bool sorted_input);
+
+  void MultiGetCommon(const ReadOptions& options, const size_t num_keys,
+                      ColumnFamilyHandle** column_families, const Slice* keys,
+                      PinnableSlice* values, PinnableWideColumns* columns,
+                      std::string* timestamps, Status* statuses,
+                      bool sorted_input);
 
   // A structure to hold the information required to process MultiGet of keys
   // belonging to one column family. For a multi column family MultiGet, there
@@ -1959,15 +2428,18 @@ class DBImpl : public DB {
   // If callback is non-null, the callback is refreshed with the snapshot
   // sequence number
   //
-  // A return value of true indicates that the SuperVersions were obtained
-  // from the ColumnFamilyData, whereas false indicates they are thread
-  // local
+  // `sv_from_thread_local` being set to false indicates that the SuperVersion
+  // obtained from the ColumnFamilyData, whereas true indicates they are thread
+  // local.
+  // A non-OK status will be returned if for a column family that enables
+  // user-defined timestamp feature, the specified `ReadOptions.timestamp`
+  // attemps to read collapsed history.
   template <class T>
-  bool MultiCFSnapshot(
+  Status MultiCFSnapshot(
       const ReadOptions& read_options, ReadCallback* callback,
       std::function<MultiGetColumnFamilyData*(typename T::iterator&)>&
           iter_deref_func,
-      T* cf_list, SequenceNumber* snapshot);
+      T* cf_list, SequenceNumber* snapshot, bool* sv_from_thread_local);
 
   // The actual implementation of the batching MultiGet. The caller is expected
   // to have acquired the SuperVersion and pass in a snapshot sequence number
@@ -1978,20 +2450,43 @@ class DBImpl : public DB {
       autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* sorted_keys,
       SuperVersion* sv, SequenceNumber snap_seqnum, ReadCallback* callback);
 
+  void MultiGetWithCallbackImpl(
+      const ReadOptions& read_options, ColumnFamilyHandle* column_family,
+      ReadCallback* callback,
+      autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* sorted_keys);
+
   Status DisableFileDeletionsWithLock();
 
-  Status IncreaseFullHistoryTsLow(ColumnFamilyData* cfd, std::string ts_low);
+  Status IncreaseFullHistoryTsLowImpl(ColumnFamilyData* cfd,
+                                      std::string ts_low);
+
+  // Return any column family (not dropped) with flush disabled
+  //
+  // REQUIRES: mutex_ locked
+  ColumnFamilyData* GetAnyCFWithAutoFlushDisabled() const;
+
+  bool ShouldReferenceSuperVersion(const MergeContext& merge_context);
 
   // Lock over the persistent DB state.  Non-nullptr iff successfully acquired.
   FileLock* db_lock_;
 
-  // In addition to mutex_, log_write_mutex_ protected writes to stats_history_
+  // Guards changes to DB and CF options to ensure consistency between
+  // * In-memory options objects
+  // * Settings in effect
+  // * Options file contents
+  // while allowing the DB mutex to be released during slow operations like
+  // persisting options file or modifying global periodic task timer.
+  // Always acquired *before* DB mutex when this one is applicable.
+  InstrumentedMutex options_mutex_;
+
+  // Guards reads and writes to in-memory stats_history_.
   InstrumentedMutex stats_history_mutex_;
-  // In addition to mutex_, log_write_mutex_ protected writes to logs_ and
+
+  // In addition to mutex_, log_write_mutex_ protects writes to logs_ and
   // logfile_number_. With two_write_queues it also protects alive_log_files_,
   // and log_empty_. Refer to the definition of each variable below for more
   // details.
-  // Note: to avoid dealock, if needed to acquire both log_write_mutex_ and
+  // Note: to avoid deadlock, if needed to acquire both log_write_mutex_ and
   // mutex_, the order should be first mutex_ and then log_write_mutex_.
   InstrumentedMutex log_write_mutex_;
 
@@ -2021,49 +2516,116 @@ class DBImpl : public DB {
   // logfile_number_ is currently updated only in write_thread_, it can be read
   // from the same write_thread_ without any locks.
   uint64_t logfile_number_;
-  std::deque<uint64_t>
-      log_recycle_files_;  // a list of log files that we can recycle
+  // Log files that we can recycle. Must be protected by db mutex_.
+  std::deque<uint64_t> log_recycle_files_;
+  // Protected by log_write_mutex_.
   bool log_dir_synced_;
   // Without two_write_queues, read and writes to log_empty_ are protected by
   // mutex_. Since it is currently updated/read only in write_thread_, it can be
   // accessed from the same write_thread_ without any locks. With
   // two_write_queues writes, where it can be updated in different threads,
   // read and writes are protected by log_write_mutex_ instead. This is to avoid
-  // expesnive mutex_ lock during WAL write, which update log_empty_.
+  // expensive mutex_ lock during WAL write, which update log_empty_.
   bool log_empty_;
 
   ColumnFamilyHandleImpl* persist_stats_cf_handle_;
 
   bool persistent_stats_cfd_exists_ = true;
 
-  // Without two_write_queues, read and writes to alive_log_files_ are
-  // protected by mutex_. However since back() is never popped, and push_back()
-  // is done only from write_thread_, the same thread can access the item
-  // reffered by back() without mutex_. With two_write_queues_, writes
-  // are protected by locking both mutex_ and log_write_mutex_, and reads must
-  // be under either mutex_ or log_write_mutex_.
+  // alive_log_files_ is protected by mutex_ and log_write_mutex_ with details
+  // as follows:
+  // 1. read by FindObsoleteFiles() which can be called in either application
+  //    thread or RocksDB bg threads, both mutex_ and log_write_mutex_ are
+  //    held.
+  // 2. pop_front() by FindObsoleteFiles(), both mutex_ and log_write_mutex_
+  //    are held.
+  // 3. push_back() by DBImpl::Open() and DBImpl::RestoreAliveLogFiles()
+  //    (actually called by Open()), only mutex_ is held because at this point,
+  //    the DB::Open() call has not returned success to application, and the
+  //    only other thread(s) that can conflict are bg threads calling
+  //    FindObsoleteFiles() which ensure that both mutex_ and log_write_mutex_
+  //    are held when accessing alive_log_files_.
+  // 4. read by DBImpl::Open() is protected by mutex_.
+  // 5. push_back() by SwitchMemtable(). Both mutex_ and log_write_mutex_ are
+  //    held. This is done by the write group leader. Note that in the case of
+  //    two-write-queues, another WAL-only write thread can be writing to the
+  //    WAL concurrently. See 9.
+  // 6. read by SwitchWAL() with both mutex_ and log_write_mutex_ held. This is
+  //    done by write group leader.
+  // 7. read by ConcurrentWriteToWAL() by the write group leader in the case of
+  //    two-write-queues. Only log_write_mutex_ is held to protect concurrent
+  //    pop_front() by FindObsoleteFiles().
+  // 8. read by PreprocessWrite() by the write group leader. log_write_mutex_
+  //    is held to protect the data structure from concurrent pop_front() by
+  //    FindObsoleteFiles().
+  // 9. read by ConcurrentWriteToWAL() by a WAL-only write thread in the case
+  //    of two-write-queues. Only log_write_mutex_ is held. This suffices to
+  //    protect the data structure from concurrent push_back() by current
+  //    write group leader as well as pop_front() by FindObsoleteFiles().
   std::deque<LogFileNumberSize> alive_log_files_;
+
   // Log files that aren't fully synced, and the current log file.
   // Synchronization:
-  //  - push_back() is done from write_thread_ with locked mutex_ and
-  //  log_write_mutex_
-  //  - pop_front() is done from any thread with locked mutex_ and
-  //  log_write_mutex_
-  //  - reads are done with either locked mutex_ or log_write_mutex_
+  // 1. read by FindObsoleteFiles() which can be called either in application
+  //    thread or RocksDB bg threads. log_write_mutex_ is always held, while
+  //    some reads are performed without mutex_.
+  // 2. pop_front() by FindObsoleteFiles() with only log_write_mutex_ held.
+  // 3. read by DBImpl::Open() with both mutex_ and log_write_mutex_.
+  // 4. emplace_back() by DBImpl::Open() with both mutex_ and log_write_mutex.
+  //    Note that at this point, DB::Open() has not returned success to
+  //    application, thus the only other thread(s) that can conflict are bg
+  //    threads calling FindObsoleteFiles(). See 1.
+  // 5. iteration and clear() from CloseHelper() always hold log_write_mutex
+  //    and mutex_.
+  // 6. back() called by APIs FlushWAL() and LockWAL() are protected by only
+  //    log_write_mutex_. These two can be called by application threads after
+  //    DB::Open() returns success to applications.
+  // 7. read by SyncWAL(), another API, protected by only log_write_mutex_.
+  // 8. read by MarkLogsNotSynced() and MarkLogsSynced() are protected by
+  //    log_write_mutex_.
+  // 9. erase() by MarkLogsSynced() protected by log_write_mutex_.
+  // 10. read by SyncClosedLogs() protected by only log_write_mutex_. This can
+  //     happen in bg flush threads after DB::Open() returns success to
+  //     applications.
+  // 11. reads, e.g. front(), iteration, and back() called by PreprocessWrite()
+  //     holds only the log_write_mutex_. This is done by the write group
+  //     leader. A bg thread calling FindObsoleteFiles() or MarkLogsSynced()
+  //     can happen concurrently. This is fine because log_write_mutex_ is used
+  //     by all parties. See 2, 5, 9.
+  // 12. reads, empty(), back() called by SwitchMemtable() hold both mutex_ and
+  //     log_write_mutex_. This happens in the write group leader.
+  // 13. emplace_back() by SwitchMemtable() hold both mutex_ and
+  //     log_write_mutex_. This happens in the write group leader. Can conflict
+  //     with bg threads calling FindObsoleteFiles(), MarkLogsSynced(),
+  //     SyncClosedLogs(), etc. as well as application threads calling
+  //     FlushWAL(), SyncWAL(), LockWAL(). This is fine because all parties
+  //     require at least log_write_mutex_.
+  // 14. iteration called in WriteToWAL(write_group) protected by
+  //     log_write_mutex_. This is done by write group leader when
+  //     two-write-queues is disabled and write needs to sync logs.
+  // 15. back() called in ConcurrentWriteToWAL() protected by log_write_mutex_.
+  //     This can be done by the write group leader if two-write-queues is
+  //     enabled. It can also be done by another WAL-only write thread.
+  //
+  // Other observations:
   //  - back() and items with getting_synced=true are not popped,
   //  - The same thread that sets getting_synced=true will reset it.
   //  - it follows that the object referred by back() can be safely read from
-  //  the write_thread_ without using mutex
+  //  the write_thread_ without using mutex. Note that calling back() without
+  //  mutex may be unsafe because different implementations of deque::back() may
+  //  access other member variables of deque, causing undefined behaviors.
+  //  Generally, do not access stl containers without proper synchronization.
   //  - it follows that the items with getting_synced=true can be safely read
   //  from the same thread that has set getting_synced=true
   std::deque<LogWriterNumber> logs_;
+
   // Signaled when getting_synced becomes false for some of the logs_.
   InstrumentedCondVar log_sync_cv_;
   // This is the app-level state that is written to the WAL but will be used
   // only during recovery. Using this feature enables not writing the state to
   // memtable on normal writes and hence improving the throughput. Each new
   // write of the state will replace the previous state entirely even if the
-  // keys in the two consecuitive states do not overlap.
+  // keys in the two consecutive states do not overlap.
   // It is protected by log_write_mutex_ when two_write_queues_ is enabled.
   // Otherwise only the heaad of write_thread_ can access it.
   WriteBatch cached_recoverable_state_;
@@ -2071,7 +2633,7 @@ class DBImpl : public DB {
   std::atomic<uint64_t> total_log_size_;
 
   // If this is non-empty, we need to delete these log files in background
-  // threads. Protected by db mutex.
+  // threads. Protected by log_write_mutex_.
   autovector<log::Writer*> logs_to_free_;
 
   bool is_snapshot_supported_;
@@ -2105,6 +2667,8 @@ class DBImpl : public DB {
   TrimHistoryScheduler trim_history_scheduler_;
 
   SnapshotList snapshots_;
+
+  TimestampedSnapshotList timestamped_snapshots_;
 
   // For each background job, pending_outputs_ keeps the current file number at
   // the time that background job started.
@@ -2149,10 +2713,13 @@ class DBImpl : public DB {
   // JobContext. Current implementation tracks table and blob files only.
   std::unordered_set<uint64_t> files_grabbed_for_purge_;
 
-  // A queue to store log writers to close
+  // A queue to store log writers to close. Protected by db mutex_.
   std::deque<log::Writer*> logs_to_free_queue_;
+
   std::deque<SuperVersion*> superversions_to_free_queue_;
+
   int unscheduled_flushes_;
+
   int unscheduled_compactions_;
 
   // count how many background compactions are running or have been scheduled in
@@ -2192,9 +2759,6 @@ class DBImpl : public DB {
   // initialized with startup time.
   uint64_t delete_obsolete_files_last_run_;
 
-  // last time stats were dumped to LOG
-  std::atomic<uint64_t> last_stats_dump_time_microsec_;
-
   // The thread that wants to switch memtable, can wait on this cv until the
   // pending writes to memtable finishes.
   std::condition_variable switch_cv_;
@@ -2216,20 +2780,12 @@ class DBImpl : public DB {
   // log is fully commited.
   bool unable_to_release_oldest_log_;
 
-  static const int KEEP_LOG_FILE_NUM = 1000;
-  // MSVC version 1800 still does not have constexpr for ::max()
-  static const uint64_t kNoTimeOut = port::kMaxUint64;
-
-  std::string db_absolute_path_;
-
   // Number of running IngestExternalFile() or CreateColumnFamilyWithImport()
   // calls.
   // REQUIRES: mutex held
   int num_running_ingest_file_;
 
-#ifndef ROCKSDB_LITE
   WalManager wal_manager_;
-#endif  // ROCKSDB_LITE
 
   // A value of > 0 temporarily disables scheduling of background work
   int bg_work_paused_;
@@ -2257,13 +2813,12 @@ class DBImpl : public DB {
   // Only to be set during initialization
   std::unique_ptr<PreReleaseCallback> recoverable_state_pre_release_callback_;
 
-#ifndef ROCKSDB_LITE
   // Scheduler to run DumpStats(), PersistStats(), and FlushInfoLog().
-  // Currently, it always use a global instance from
-  // PeriodicWorkScheduler::Default(). Only in unittest, it can be overrided by
-  // PeriodicWorkTestScheduler.
-  PeriodicWorkScheduler* periodic_work_scheduler_;
-#endif
+  // Currently, internally it has a global timer instance for running the tasks.
+  PeriodicTaskScheduler periodic_task_scheduler_;
+
+  // It contains the implementations for each periodic task.
+  std::map<PeriodicTaskType, const PeriodicTaskFunc> periodic_task_functions_;
 
   // When set, we use a separate queue for writes that don't write to memtable.
   // In 2PC these are the writes at Prepare phase.
@@ -2288,15 +2843,12 @@ class DBImpl : public DB {
   // DB::Open() or passed to us
   bool own_sfm_;
 
-  // Clients must periodically call SetPreserveDeletesSequenceNumber()
-  // to advance this seqnum. Default value is 0 which means ALL deletes are
-  // preserved. Note that this has no effect if DBOptions.preserve_deletes
-  // is set to false.
-  std::atomic<SequenceNumber> preserve_deletes_seqnum_;
-  const bool preserve_deletes_;
-
   // Flag to check whether Close() has been called on this DB
   bool closed_;
+  // save the closing status, for re-calling the close()
+  Status closing_status_;
+  // mutex for DB::Close()
+  InstrumentedMutex closing_mutex_;
 
   // Conditional variable to coordinate installation of atomic flush results.
   // With atomic flush, each bg thread installs the result of flushing multiple
@@ -2309,35 +2861,47 @@ class DBImpl : public DB {
   // installed to MANIFEST first.
   InstrumentedCondVar atomic_flush_install_cv_;
 
-  // The pluggable compaction service, if registered.
-  // Protected by mutex_
-  std::shared_ptr<PluggableCompactionService> remote_compaction_service_;
-
-  Status doCompact(const CompactionOptions& compact_options,
-                   ColumnFamilyData* cfd, Version* version,
-                   const std::vector<FilesInOneLevel>& input_file_names,
-                   int output_level,
-                   const std::vector<SequenceNumber>& existing_snapshots,
-                   bool unitTests, JobContext* job_context,
-                   LogBuffer* log_buffer, PluggableCompactionResult* result);
-
   bool wal_in_db_path_;
+  std::atomic<uint64_t> max_total_wal_size_;
 
   BlobFileCompletionCallback blob_callback_;
 
   // Pointer to WriteBufferManager stalling interface.
   std::unique_ptr<StallInterface> wbm_stall_;
+
+  // seqno_to_time_mapping_ stores the sequence number to time mapping, it's not
+  // thread safe, both read and write need db mutex hold.
+  SeqnoToTimeMapping seqno_to_time_mapping_;
+
+  // Stop write token that is acquired when first LockWAL() is called.
+  // Destroyed when last UnlockWAL() is called. Controlled by DB mutex.
+  // See lock_wal_count_
+  std::unique_ptr<WriteControllerToken> lock_wal_write_token_;
+
+  // The number of LockWAL called without matching UnlockWAL call.
+  // See also lock_wal_write_token_
+  uint32_t lock_wal_count_;
 };
 
-extern Options SanitizeOptions(const std::string& db, const Options& src,
-                               bool read_only = false);
+class GetWithTimestampReadCallback : public ReadCallback {
+ public:
+  explicit GetWithTimestampReadCallback(SequenceNumber seq)
+      : ReadCallback(seq) {}
+  bool IsVisibleFullCheck(SequenceNumber seq) override {
+    return seq <= max_visible_seq_;
+  }
+};
 
-extern DBOptions SanitizeOptions(const std::string& db, const DBOptions& src,
-                                 bool read_only = false);
+Options SanitizeOptions(const std::string& db, const Options& src,
+                        bool read_only = false,
+                        Status* logger_creation_s = nullptr);
 
-extern CompressionType GetCompressionFlush(
-    const ImmutableCFOptions& ioptions,
-    const MutableCFOptions& mutable_cf_options);
+DBOptions SanitizeOptions(const std::string& db, const DBOptions& src,
+                          bool read_only = false,
+                          Status* logger_creation_s = nullptr);
+
+CompressionType GetCompressionFlush(const ImmutableCFOptions& ioptions,
+                                    const MutableCFOptions& mutable_cf_options);
 
 // Return the earliest log file to keep after the memtable flush is
 // finalized.
@@ -2345,13 +2909,13 @@ extern CompressionType GetCompressionFlush(
 // `memtables_to_flush`) will be flushed and thus will not depend on any WAL
 // file.
 // The function is only applicable to 2pc mode.
-extern uint64_t PrecomputeMinLogNumberToKeep2PC(
+uint64_t PrecomputeMinLogNumberToKeep2PC(
     VersionSet* vset, const ColumnFamilyData& cfd_to_flush,
     const autovector<VersionEdit*>& edit_list,
     const autovector<MemTable*>& memtables_to_flush,
     LogsWithPrepTracker* prep_tracker);
 // For atomic flush.
-extern uint64_t PrecomputeMinLogNumberToKeep2PC(
+uint64_t PrecomputeMinLogNumberToKeep2PC(
     VersionSet* vset, const autovector<ColumnFamilyData*>& cfds_to_flush,
     const autovector<autovector<VersionEdit*>>& edit_lists,
     const autovector<const autovector<MemTable*>*>& memtables_to_flush,
@@ -2359,23 +2923,22 @@ extern uint64_t PrecomputeMinLogNumberToKeep2PC(
 
 // In non-2PC mode, WALs with log number < the returned number can be
 // deleted after the cfd_to_flush column family is flushed successfully.
-extern uint64_t PrecomputeMinLogNumberToKeepNon2PC(
+uint64_t PrecomputeMinLogNumberToKeepNon2PC(
     VersionSet* vset, const ColumnFamilyData& cfd_to_flush,
     const autovector<VersionEdit*>& edit_list);
 // For atomic flush.
-extern uint64_t PrecomputeMinLogNumberToKeepNon2PC(
+uint64_t PrecomputeMinLogNumberToKeepNon2PC(
     VersionSet* vset, const autovector<ColumnFamilyData*>& cfds_to_flush,
     const autovector<autovector<VersionEdit*>>& edit_lists);
 
 // `cfd_to_flush` is the column family whose memtable will be flushed and thus
 // will not depend on any WAL file. nullptr means no memtable is being flushed.
 // The function is only applicable to 2pc mode.
-extern uint64_t FindMinPrepLogReferencedByMemTable(
-    VersionSet* vset, const ColumnFamilyData* cfd_to_flush,
-    const autovector<MemTable*>& memtables_to_flush);
+uint64_t FindMinPrepLogReferencedByMemTable(
+    VersionSet* vset, const autovector<MemTable*>& memtables_to_flush);
 // For atomic flush.
-extern uint64_t FindMinPrepLogReferencedByMemTable(
-    VersionSet* vset, const autovector<ColumnFamilyData*>& cfds_to_flush,
+uint64_t FindMinPrepLogReferencedByMemTable(
+    VersionSet* vset,
     const autovector<const autovector<MemTable*>*>& memtables_to_flush);
 
 // Fix user-supplied options to be reasonable
@@ -2385,4 +2948,66 @@ static void ClipToRange(T* ptr, V minvalue, V maxvalue) {
   if (static_cast<V>(*ptr) < minvalue) *ptr = minvalue;
 }
 
+inline Status DBImpl::FailIfCfHasTs(
+    const ColumnFamilyHandle* column_family) const {
+  if (!column_family) {
+    return Status::InvalidArgument("column family handle cannot be null");
+  }
+  assert(column_family);
+  const Comparator* const ucmp = column_family->GetComparator();
+  assert(ucmp);
+  if (ucmp->timestamp_size() > 0) {
+    std::ostringstream oss;
+    oss << "cannot call this method on column family "
+        << column_family->GetName() << " that enables timestamp";
+    return Status::InvalidArgument(oss.str());
+  }
+  return Status::OK();
+}
+
+inline Status DBImpl::FailIfTsMismatchCf(ColumnFamilyHandle* column_family,
+                                         const Slice& ts) const {
+  if (!column_family) {
+    return Status::InvalidArgument("column family handle cannot be null");
+  }
+  assert(column_family);
+  const Comparator* const ucmp = column_family->GetComparator();
+  assert(ucmp);
+  if (0 == ucmp->timestamp_size()) {
+    std::stringstream oss;
+    oss << "cannot call this method on column family "
+        << column_family->GetName() << " that does not enable timestamp";
+    return Status::InvalidArgument(oss.str());
+  }
+  const size_t ts_sz = ts.size();
+  if (ts_sz != ucmp->timestamp_size()) {
+    std::stringstream oss;
+    oss << "Timestamp sizes mismatch: expect " << ucmp->timestamp_size() << ", "
+        << ts_sz << " given";
+    return Status::InvalidArgument(oss.str());
+  }
+  return Status::OK();
+}
+
+inline Status DBImpl::FailIfReadCollapsedHistory(const ColumnFamilyData* cfd,
+                                                 const SuperVersion* sv,
+                                                 const Slice& ts) const {
+  // Reaching to this point means the timestamp size matching sanity check in
+  // `DBImpl::FailIfTsMismatchCf` already passed. So we skip that and assume
+  // column family has the same user-defined timestamp format as `ts`.
+  const Comparator* const ucmp = cfd->user_comparator();
+  assert(ucmp);
+  const std::string& full_history_ts_low = sv->full_history_ts_low;
+  assert(full_history_ts_low.empty() ||
+         full_history_ts_low.size() == ts.size());
+  if (!full_history_ts_low.empty() &&
+      ucmp->CompareTimestamp(ts, full_history_ts_low) < 0) {
+    std::stringstream oss;
+    oss << "Read timestamp: " << ts.ToString(true)
+        << " is smaller than full_history_ts_low: "
+        << Slice(full_history_ts_low).ToString(true) << std::endl;
+    return Status::InvalidArgument(oss.str());
+  }
+  return Status::OK();
+}
 }  // namespace ROCKSDB_NAMESPACE

@@ -22,6 +22,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "rocksdb/cache.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
@@ -44,11 +45,18 @@ class WritableFileWriter;
 struct ConfigOptions;
 struct EnvOptions;
 
+// Types of checksums to use for checking integrity of logical blocks within
+// files. All checksums currently use 32 bits of checking power (1 in 4B
+// chance of failing to detect random corruption). Traditionally, the actual
+// checking power can be far from ideal if the corruption is due to misplaced
+// data (e.g. physical blocks out of order in a file, or from another file),
+// which is fixed in format_version=6 (see below).
 enum ChecksumType : char {
   kNoChecksum = 0x0,
   kCRC32c = 0x1,
   kxxHash = 0x2,
   kxxHash64 = 0x3,
+  kXXH3 = 0x4,  // Supported since RocksDB 6.27
 };
 
 // `PinningTier` is used to specify which tier of block-based tables should
@@ -100,9 +108,27 @@ struct MetadataCacheOptions {
   PinningTier unpartitioned_pinning = PinningTier::kFallback;
 };
 
+struct CacheEntryRoleOptions {
+  enum class Decision {
+    kEnabled,
+    kDisabled,
+    kFallback,
+  };
+  Decision charged = Decision::kFallback;
+  bool operator==(const CacheEntryRoleOptions& other) const {
+    return charged == other.charged;
+  }
+};
+
+struct CacheUsageOptions {
+  CacheEntryRoleOptions options;
+  std::map<CacheEntryRole, CacheEntryRoleOptions> options_overrides;
+};
+
+
 // For advanced user only
 struct BlockBasedTableOptions {
-  static const char* kName() { return "BlockTableOptions"; };
+  static const char* kName() { return "BlockTableOptions"; }
   // @flush_block_policy_factory creates the instances of flush block policy.
   // which provides a configurable way to determine when to flush a block in
   // the block based tables.  If not set, table builder will use the default
@@ -117,15 +143,16 @@ struct BlockBasedTableOptions {
   // caching as they should now apply to range tombstone and compression
   // dictionary meta-blocks, in addition to index and filter meta-blocks.
   //
-  // Indicating if we'd put index/filter blocks to the block cache.
-  // If not specified, each "table reader" object will pre-load index/filter
-  // block during table initialization.
+  // Whether to put index/filter blocks in the block cache. When false,
+  // each "table reader" object will pre-load index/filter blocks during
+  // table initialization. Index and filter partition blocks always use
+  // block cache regardless of this option.
   bool cache_index_and_filter_blocks = false;
 
   // If cache_index_and_filter_blocks is enabled, cache index and filter
   // blocks with high priority. If set to true, depending on implementation of
-  // block cache, index and filter blocks may be less likely to be evicted
-  // than data blocks.
+  // block cache, index, filter, and other metadata blocks may be less likely
+  // to be evicted than data blocks.
   bool cache_index_and_filter_blocks_with_high_priority = true;
 
   // DEPRECATED: This option will be removed in a future version. For now, this
@@ -190,6 +217,8 @@ struct BlockBasedTableOptions {
     kHashSearch = 0x01,
 
     // A two-level index implementation. Both levels are binary search indexes.
+    // Second level index blocks ("partitions") use block cache even when
+    // cache_index_and_filter_blocks=false.
     kTwoLevelIndexSearch = 0x02,
 
     // Like kBinarySearch, but index also contains first key of each block.
@@ -220,14 +249,13 @@ struct BlockBasedTableOptions {
   // kDataBlockBinaryAndHash.
   double data_block_hash_table_util_ratio = 0.75;
 
-  // This option is now deprecated. No matter what value it is set to,
-  // it will behave as if hash_index_allow_collision=true.
-  bool hash_index_allow_collision = true;
+  // Option hash_index_allow_collision is now deleted.
+  // It will behave as if hash_index_allow_collision=true.
 
   // Use the specified checksum type. Newly created table files will be
   // protected with this checksum type. Old table files will still be readable,
   // even though they have different checksum type.
-  ChecksumType checksum = kCRC32c;
+  ChecksumType checksum = kXXH3;
 
   // Disable block cache. If this is set to true,
   // then no block cache should be used, and the block_cache should
@@ -235,24 +263,18 @@ struct BlockBasedTableOptions {
   bool no_block_cache = false;
 
   // If non-NULL use the specified cache for blocks.
-  // If NULL, rocksdb will automatically create and use an 8MB internal cache.
+  // If NULL, rocksdb will automatically create and use a 32MB internal cache.
   std::shared_ptr<Cache> block_cache = nullptr;
 
   // If non-NULL use the specified cache for pages read from device
   // IF NULL, no page cache is used
   std::shared_ptr<PersistentCache> persistent_cache = nullptr;
 
-  // If non-NULL use the specified cache for compressed blocks.
-  // If NULL, rocksdb will not use a compressed block cache.
-  // Note: though it looks similar to `block_cache`, RocksDB doesn't put the
-  //       same type of object there.
-  std::shared_ptr<Cache> block_cache_compressed = nullptr;
-
   // Approximate size of user data packed per block.  Note that the
   // block size specified here corresponds to uncompressed data.  The
   // actual size of the unit read from disk may be smaller if
   // compression is enabled.  This parameter can be changed dynamically.
-  size_t block_size = 4 * 1024;
+  uint64_t block_size = 4 * 1024;
 
   // This is used to close a block before it reaches the configured
   // 'block_size'. If the percentage of free space in the current block is less
@@ -281,11 +303,100 @@ struct BlockBasedTableOptions {
   // separately
   uint64_t metadata_block_size = 4096;
 
+  // `cache_usage_options` allows users to specify the default
+  // options (`cache_usage_options.options`) and the overriding
+  // options (`cache_usage_options.options_overrides`)
+  // for different `CacheEntryRole` under various features related to cache
+  // usage.
+  //
+  // For a certain `CacheEntryRole role` and a certain feature `f` of
+  // `CacheEntryRoleOptions`:
+  // 1. If `options_overrides` has an entry for `role` and
+  // `options_overrides[role].f != kFallback`, we use
+  // `options_overrides[role].f`
+  // 2. Otherwise, if `options[role].f != kFallback`, we use `options[role].f`
+  // 3. Otherwise, we follow the compatible existing behavior for `f` (see
+  // each feature's comment for more)
+  //
+  // `cache_usage_options` currently supports specifying options for the
+  // following features:
+  //
+  // 1. Memory charging to block cache (`CacheEntryRoleOptions::charged`)
+  // Memory charging is a feature of accounting memory usage of specific area
+  // (represented by `CacheEntryRole`) toward usage in block cache (if
+  // available), by updating a dynamical charge to the block cache loosely based
+  // on the actual memory usage of that area.
+  //
+  // (a) CacheEntryRole::kCompressionDictionaryBuildingBuffer
+  // (i) If kEnabled:
+  // Charge memory usage of the buffered data used as training samples for
+  // dictionary compression.
+  // If such memory usage exceeds the avaible space left in the block cache
+  // at some point (i.e, causing a cache full under
+  // `LRUCacheOptions::strict_capacity_limit` = true), the data will then be
+  // unbuffered.
+  // (ii) If kDisabled:
+  // Does not charge the memory usage mentioned above.
+  // (iii) Compatible existing behavior:
+  // Same as kEnabled.
+  //
+  // (b) CacheEntryRole::kFilterConstruction
+  // (i) If kEnabled:
+  // Charge memory usage of Bloom Filter
+  // (format_version >= 5) and Ribbon Filter construction.
+  // If additional temporary memory of Ribbon Filter exceeds the avaible
+  // space left in the block cache at some point (i.e, causing a cache full
+  // under `LRUCacheOptions::strict_capacity_limit` = true),
+  // construction will fall back to Bloom Filter.
+  // (ii) If kDisabled:
+  // Does not charge the memory usage mentioned above.
+  // (iii) Compatible existing behavior:
+  // Same as kDisabled.
+  //
+  // (c) CacheEntryRole::kBlockBasedTableReader
+  // (i) If kEnabled:
+  // Charge memory usage of table properties +
+  // index block/filter block/uncompression dictionary (when stored in table
+  // reader i.e, BlockBasedTableOptions::cache_index_and_filter_blocks ==
+  // false) + some internal data structures during table reader creation.
+  // If such a table reader exceeds
+  // the avaible space left in the block cache at some point (i.e, causing
+  // a cache full under `LRUCacheOptions::strict_capacity_limit` = true),
+  // creation will fail with Status::MemoryLimit().
+  // (ii) If kDisabled:
+  // Does not charge the memory usage mentioned above.
+  // (iii) Compatible existing behavior:
+  // Same as kDisabled.
+  //
+  // (d) CacheEntryRole::kFileMetadata
+  // (i) If kEnabled:
+  // Charge memory usage of file metadata. RocksDB holds one file metadata
+  // structure in-memory per on-disk table file.
+  // If such file metadata's
+  // memory exceeds the avaible space left in the block cache at some point
+  // (i.e, causing a cache full under `LRUCacheOptions::strict_capacity_limit` =
+  // true), creation will fail with Status::MemoryLimit().
+  // (ii) If kDisabled:
+  // Does not charge the memory usage mentioned above.
+  // (iii) Compatible existing behavior:
+  // Same as kDisabled.
+  //
+  // (e) Other CacheEntryRole
+  // Not supported.
+  // `Status::kNotSupported` will be returned if
+  // `CacheEntryRoleOptions::charged` is set to {`kEnabled`, `kDisabled`}.
+  //
+  //
+  // 2. More to come ...
+  //
+  CacheUsageOptions cache_usage_options;
+
   // Note: currently this option requires kTwoLevelIndexSearch to be set as
   // well.
   // TODO(myabandeh): remove the note above once the limitation is lifted
   // Use partitioned full filters for each SST file. This option is
-  // incompatible with block-based filters.
+  // incompatible with block-based filters. Filter partition blocks use
+  // block cache even when cache_index_and_filter_blocks=false.
   bool partition_filters = false;
 
   // Option to generate Bloom/Ribbon filters that minimize memory
@@ -338,6 +449,20 @@ struct BlockBasedTableOptions {
   // This must generally be true for gets to be efficient.
   bool whole_key_filtering = true;
 
+  // If true, detect corruption during Bloom Filter (format_version >= 5)
+  // and Ribbon Filter construction.
+  //
+  // This is an extra check that is only
+  // useful in detecting software bugs or CPU+memory malfunction.
+  // Turning on this feature increases filter construction time by 30%.
+  //
+  // This parameter can be changed dynamically by
+  // DB::SetOptions({{"block_based_table_factory",
+  //                  "{detect_filter_construct_corruption=true;}"}});
+  //
+  // TODO: optimize this performance
+  bool detect_filter_construct_corruption = false;
+
   // Verify that decompressing the compressed block gives back the input. This
   // is a verification mode that we use to detect bugs in compression
   // algorithms.
@@ -366,10 +491,9 @@ struct BlockBasedTableOptions {
   // Default: 0 (disabled)
   uint32_t read_amp_bytes_per_bit = 0;
 
-  // We currently have five versions:
-  // 0 -- This version is currently written out by all RocksDB's versions by
-  // default.  Can be read by really old RocksDB's. Doesn't support changing
-  // checksum (default is CRC32).
+  // We currently have these versions:
+  // 0 -- This version can be read by really old RocksDB's. Doesn't support
+  // changing checksum type (default is CRC32).
   // 1 -- Can be read by RocksDB's versions since 3.0. Supports non-default
   // checksum, like xxHash. It is written by RocksDB when
   // BlockBasedTableOptions::checksum is something other than kCRC32c. (version
@@ -392,7 +516,18 @@ struct BlockBasedTableOptions {
   // 5 -- Can be read by RocksDB's versions since 6.6.0. Full and partitioned
   // filters use a generally faster and more accurate Bloom filter
   // implementation, with a different schema.
-  uint32_t format_version = 5;
+  // 6 -- Modified the file footer and checksum matching so that SST data
+  // misplaced within or between files is as likely to fail checksum
+  // verification as random corruption. Also checksum-protects SST footer.
+  // Can be read by RocksDB versions >= 8.6.0.
+  //
+  // Using the default setting of format_version is strongly recommended, so
+  // that available enhancements are adopted eventually and automatically. The
+  // default setting will only update to the latest after thorough production
+  // validation and sufficient time and number of releases have elapsed
+  // (6 months recommended) to ensure a clean downgrade/revert path for users
+  // who might only upgrade a few times per year.
+  uint32_t format_version = 6;
 
   // Store index blocks on disk in compressed format. Changing this option to
   // false  will avoid the overhead of decompression if index blocks are evicted
@@ -439,14 +574,15 @@ struct BlockBasedTableOptions {
 
   // RocksDB does auto-readahead for iterators on noticing more than two reads
   // for a table file if user doesn't provide readahead_size. The readahead
-  // starts at 8KB and doubles on every additional read upto
-  // max_auto_readahead_size and max_auto_readahead_size can be configured.
+  // starts at BlockBasedTableOptions.initial_auto_readahead_size (default: 8KB)
+  // and doubles on every additional read upto max_auto_readahead_size and
+  // max_auto_readahead_size can be configured.
   //
-  // Special Value: 0 - If max_auto_readahead_size is set 0 then no implicit
-  // auto prefetching will be done. If max_auto_readahead_size provided is less
-  // than 8KB (which is initial readahead size used by rocksdb in case of
-  // auto-readahead), readahead size will remain same as
-  // max_auto_readahead_size.
+  // Special Value: 0 - If max_auto_readahead_size is set 0 then it will disable
+  // the implicit auto prefetching.
+  // If max_auto_readahead_size provided is less
+  // than initial_auto_readahead_size, then RocksDB will sanitize the
+  // initial_auto_readahead_size and set it to max_auto_readahead_size.
   //
   // Value should be provided along with KB i.e. 256 * 1024 as it will prefetch
   // the blocks.
@@ -464,27 +600,85 @@ struct BlockBasedTableOptions {
   // Default: 256 KB (256 * 1024).
   size_t max_auto_readahead_size = 256 * 1024;
 
-  // If enabled, prepopulate warm/hot data blocks which are already in memory
-  // into block cache at the time of flush. On a flush, the data block that is
-  // in memory (in memtables) get flushed to the device. If using Direct IO,
-  // additional IO is incurred to read this data back into memory again, which
-  // is avoided by enabling this option. This further helps if the workload
-  // exhibits high temporal locality, where most of the reads go to recently
-  // written data. This also helps in case of Distributed FileSystem.
+  // If enabled, prepopulate warm/hot blocks (data, uncompressed dict, index and
+  // filter blocks) which are already in memory into block cache at the time of
+  // flush. On a flush, the block that is in memory (in memtables) get flushed
+  // to the device. If using Direct IO, additional IO is incurred to read this
+  // data back into memory again, which is avoided by enabling this option. This
+  // further helps if the workload exhibits high temporal locality, where most
+  // of the reads go to recently written data. This also helps in case of
+  // Distributed FileSystem.
   //
-  // Right now, this is enabled only for flush for data blocks. We plan to
-  // expand this option to cover compactions in the future and for other types
-  // of blocks.
+  // This parameter can be changed dynamically by
+  // DB::SetOptions({{"block_based_table_factory",
+  //                  "{prepopulate_block_cache=kFlushOnly;}"}}));
   enum class PrepopulateBlockCache : char {
     // Disable prepopulate block cache.
     kDisable,
-    // Prepopulate data blocks during flush only. Plan to extend it to all block
-    // types.
+    // Prepopulate blocks during flush only.
     kFlushOnly,
+    // Prepopulate blocks during flush and compaction. For compaction, only
+    // blocks of sst files pass `compaction_prepopulate_block_cache_filter`
+    // are applied
+    kFlushAndCompaction
   };
 
   PrepopulateBlockCache prepopulate_block_cache =
       PrepopulateBlockCache::kDisable;
+
+  // RocksDB does auto-readahead for iterators on noticing more than two reads
+  // for a table file if user doesn't provide readahead_size. The readahead size
+  // starts at initial_auto_readahead_size and doubles on every additional read
+  // upto BlockBasedTableOptions.max_auto_readahead_size.
+  // max_auto_readahead_size can also be configured.
+  //
+  // Scenarios:
+  // - If initial_auto_readahead_size is set 0 then it will disabled the
+  //   implicit auto prefetching irrespective of max_auto_readahead_size.
+  // - If max_auto_readahead_size is set 0, it will disable the internal
+  //    prefetching irrespective of initial_auto_readahead_size.
+  // - If initial_auto_readahead_size > max_auto_readahead_size, then RocksDB
+  //   will sanitize the value of initial_auto_readahead_size to
+  //   max_auto_readahead_size and readahead_size will be
+  //   max_auto_readahead_size.
+  //
+  // Value should be provided along with KB i.e. 8 * 1024 as it will prefetch
+  // the blocks.
+  //
+  // This parameter can be changed dynamically by
+  // DB::SetOptions({{"block_based_table_factory",
+  //                  "{initial_auto_readahead_size=0;}"}}));
+  //
+  // Changing the value dynamically will only affect files opened after the
+  // change.
+  //
+  // Default: 8 KB (8 * 1024).
+  size_t initial_auto_readahead_size = 8 * 1024;
+
+  // RocksDB does auto-readahead for iterators on noticing more than two reads
+  // for a table file if user doesn't provide readahead_size and reads are
+  // sequential.
+  // num_file_reads_for_auto_readahead indicates after how many
+  // sequential reads internal auto prefetching should be start.
+  //
+  // For example, if value is 2 then after reading 2 sequential data blocks on
+  // third data block prefetching will start.
+  // If set 0, it will start prefetching from the first read.
+  //
+  // This parameter can be changed dynamically by
+  // DB::SetOptions({{"block_based_table_factory",
+  //                  "{num_file_reads_for_auto_readahead=0;}"}}));
+  //
+  // Changing the value dynamically will only affect files opened after the
+  // change.
+  //
+  // Default: 2
+  uint64_t num_file_reads_for_auto_readahead = 2;
+
+  // Whether to prepopulate blocks generated by compaction.
+  // Only applied when `prepopulate_block_cache=kFlushAndCompaction`
+  std::function<bool(const TableProperties&)>
+      compaction_prepopulate_block_cache_filter;
 };
 
 // Table Properties that are specific to block-based table properties.
@@ -498,10 +692,8 @@ struct BlockBasedTablePropertyNames {
 };
 
 // Create default block based table factory.
-extern TableFactory* NewBlockBasedTableFactory(
+TableFactory* NewBlockBasedTableFactory(
     const BlockBasedTableOptions& table_options = BlockBasedTableOptions());
-
-#ifndef ROCKSDB_LITE
 
 enum EncodingType : char {
   // Always write full keys without any special encoding.
@@ -530,7 +722,7 @@ struct PlainTablePropertyNames {
 const uint32_t kPlainTableVariableLength = 0;
 
 struct PlainTableOptions {
-  static const char* kName() { return "PlainTableOptions"; };
+  static const char* kName() { return "PlainTableOptions"; }
   // @user_key_len: plain table has optimization for fix-sized keys, which can
   //                be specified via user_key_len.  Alternatively, you can pass
   //                `kPlainTableVariableLength` if your keys have variable
@@ -588,7 +780,7 @@ struct PlainTableOptions {
 // the hash bucket found, a binary search is executed for hash conflicts.
 // Finally, a linear search is used.
 
-extern TableFactory* NewPlainTableFactory(
+TableFactory* NewPlainTableFactory(
     const PlainTableOptions& options = PlainTableOptions());
 
 struct CuckooTablePropertyNames {
@@ -624,7 +816,7 @@ struct CuckooTablePropertyNames {
 };
 
 struct CuckooTableOptions {
-  static const char* kName() { return "CuckooTableOptions"; };
+  static const char* kName() { return "CuckooTableOptions"; }
 
   // Determines the utilization of hash tables. Smaller values
   // result in larger hash tables with fewer collisions.
@@ -655,22 +847,20 @@ struct CuckooTableOptions {
 };
 
 // Cuckoo Table Factory for SST table format using Cache Friendly Cuckoo Hashing
-extern TableFactory* NewCuckooTableFactory(
+TableFactory* NewCuckooTableFactory(
     const CuckooTableOptions& table_options = CuckooTableOptions());
-
-#endif  // ROCKSDB_LITE
 
 class RandomAccessFileReader;
 
 // A base class for table factories.
 class TableFactory : public Customizable {
  public:
-  virtual ~TableFactory() override {}
+  ~TableFactory() override {}
 
-  static const char* kBlockCacheOpts() { return "BlockCache"; };
-  static const char* kBlockBasedTableName() { return "BlockBasedTable"; };
+  static const char* kBlockCacheOpts() { return "BlockCache"; }
+  static const char* kBlockBasedTableName() { return "BlockBasedTable"; }
   static const char* kPlainTableName() { return "PlainTable"; }
-  static const char* kCuckooTableName() { return "CuckooTable"; };
+  static const char* kCuckooTableName() { return "CuckooTable"; }
 
   // Creates and configures a new TableFactory from the input options and id.
   static Status CreateFromString(const ConfigOptions& config_options,
@@ -740,7 +930,6 @@ class TableFactory : public Customizable {
   virtual bool IsDeleteRangeSupported() const { return false; }
 };
 
-#ifndef ROCKSDB_LITE
 // Create a special table factory that can open either of the supported
 // table formats, based on setting inside the SST files. It should be used to
 // convert a DB from one table format to another.
@@ -750,12 +939,10 @@ class TableFactory : public Customizable {
 // @plain_table_factory: plain table factory to use. If NULL, use a default one.
 // @cuckoo_table_factory: cuckoo table factory to use. If NULL, use a default
 // one.
-extern TableFactory* NewAdaptiveTableFactory(
+TableFactory* NewAdaptiveTableFactory(
     std::shared_ptr<TableFactory> table_factory_to_write = nullptr,
     std::shared_ptr<TableFactory> block_based_table_factory = nullptr,
     std::shared_ptr<TableFactory> plain_table_factory = nullptr,
     std::shared_ptr<TableFactory> cuckoo_table_factory = nullptr);
-
-#endif  // ROCKSDB_LITE
 
 }  // namespace ROCKSDB_NAMESPACE

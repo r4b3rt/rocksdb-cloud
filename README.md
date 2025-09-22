@@ -1,7 +1,5 @@
 ## RocksDB-Cloud: A Key-Value Store for Cloud Applications
 
-[![Build Status](https://travis-ci.org/rockset/rocksdb-cloud.svg?branch=master)](https://travis-ci.org/rockset/rocksdb-cloud)
-
 RocksDB-Cloud is a C++ library that brings the power of RocksDB to AWS, Google Cloud and Microsoft Azure.
 It leverages the power of RocksDB to provide fast key-value access to data stored
 in Flash and RAM systems. It provides for data durability even in the face of
@@ -19,8 +17,6 @@ RocksDB-Cloud provides three main advantages for AWS environments:
 
 ### Inherits from RocksDB:
 
-RocksDB-Cloud is API compatible and data format compatible with [RocksDB](https://github.com/facebook/rocksdb).
-
 RocksDB is developed and maintained by Facebook Database Engineering Team.
 It is built on earlier work on [LevelDB](https://github.com/google/leveldb) by Sanjay Ghemawat (sanjay@google.com)
 and Jeff Dean (jeff@google.com)
@@ -33,7 +29,7 @@ and Space-Amplification-Factor (SAF). It has multi-threaded compactions,
 making it especially suitable for storing multiple terabytes of data in a
 single database.
 
-Start with example usage here: https://github.com/facebook/rocksdb/tree/master/examples
+Start with example usage here: https://github.com/facebook/rocksdb/tree/main/examples
 
 See the [github wiki](https://github.com/facebook/rocksdb/wiki) for more explanation.
 
@@ -41,7 +37,7 @@ The public interface is in `include/`.  Callers should not include or
 rely on the details of any other header files in this package.  Those
 internal APIs may be changed without warning.
 
-Design discussions are conducted in https://www.facebook.com/groups/rocksdb.dev/ and https://rocksdb.slack.com/
+Questions and discussions are welcome on the [RocksDB Developers Public](https://www.facebook.com/groups/rocksdb.dev/) Facebook group and [email list](https://groups.google.com/g/rocksdb) on Google Groups.
 
 ### Developer
 To run necessary tests, use `run_tests.sh` script

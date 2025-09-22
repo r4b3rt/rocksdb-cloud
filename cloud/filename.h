@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <rocksdb/slice.h>
+
 #include <algorithm>
 #include <functional>
 #include <string>
@@ -78,14 +80,22 @@ inline bool ends_with(std::string const& value, std::string const& ending) {
   return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
 }
 
-inline std::string CloudManifestFile(const std::string& dbname) {
-  return dbname + "/CLOUDMANIFEST";
+inline std::string MakeCloudManifestFile(const std::string& cookie) {
+  return cookie.empty() ? "CLOUDMANIFEST" : "CLOUDMANIFEST-" + cookie;
+}
+inline std::string MakeCloudManifestFile(const std::string& dbname,
+                                         const std::string& cookie) {
+  assert(!dbname.empty());
+  return dbname + "/" + MakeCloudManifestFile(cookie);
 }
 
+inline std::string ManifestFileWithEpoch(const std::string& epoch) {
+  return epoch.empty() ? "MANIFEST" : "MANIFEST-" + epoch;
+}
 inline std::string ManifestFileWithEpoch(const std::string& dbname,
                                          const std::string& epoch) {
-  return epoch.empty() ? (dbname + "/MANIFEST")
-                       : (dbname + "/MANIFEST-" + epoch);
+  assert(!dbname.empty());
+  return dbname + "/" + ManifestFileWithEpoch(epoch);
 }
 
 inline std::string RemoveEpoch(const std::string& path) {
@@ -98,6 +108,18 @@ inline std::string RemoveEpoch(const std::string& path) {
     return path.substr(0, lastDash);
   }
   return path;
+}
+
+// Get the cookie suffix from cloud manifest file path
+inline std::string GetCookie(const std::string& cloud_manifest_file_path) {
+  auto cloud_manifest_fname = basename(cloud_manifest_file_path);
+  auto firstDash = cloud_manifest_fname.find('-');
+  if (firstDash == std::string::npos) {
+    // no cookie suffix in cloud manifest file path
+    return "";
+  }
+
+  return cloud_manifest_fname.substr(firstDash + 1);
 }
 
 // pathaname seperator
@@ -135,14 +157,14 @@ inline bool IsWalFile(const std::string& pathname) {
 
 inline bool IsManifestFile(const std::string& pathname) {
   // extract last component of the path
-  std::string fname;
+  rocksdb::Slice fname;
   size_t offset = pathname.find_last_of(pathsep);
   if (offset != std::string::npos) {
-    fname = pathname.substr(offset + 1, pathname.size());
+    fname = rocksdb::Slice(&pathname[offset + 1], pathname.size() - offset - 1);
   } else {
     fname = pathname;
   }
-  if (fname.find("MANIFEST") == 0) {
+  if (fname.starts_with("MANIFEST")) {
     return true;
   }
   return false;
@@ -166,6 +188,14 @@ inline bool IsIdentityFile(const std::string& pathname) {
 // A log file has ".log" suffix
 inline bool IsLogFile(const std::string& pathname) {
   return IsWalFile(pathname);
+}
+
+inline bool IsCloudManifestFile(const std::string& pathname) {
+  std::string fname = basename(pathname);
+  if (fname.find("CLOUDMANIFEST") == 0) {
+    return true;
+  }
+  return false;
 }
 
 enum class RocksDBFileType {

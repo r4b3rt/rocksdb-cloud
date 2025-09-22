@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#ifndef ROCKSDB_LITE
 
 #include "file/filename.h"
 #include "logging/logging.h"
@@ -13,8 +12,7 @@
 
 // BlobDBImpl methods to get snapshot of files, e.g. for replication.
 
-namespace ROCKSDB_NAMESPACE {
-namespace blob_db {
+namespace ROCKSDB_NAMESPACE::blob_db {
 
 Status BlobDBImpl::DisableFileDeletions() {
   // Disable base DB file deletions.
@@ -36,9 +34,9 @@ Status BlobDBImpl::DisableFileDeletions() {
   return Status::OK();
 }
 
-Status BlobDBImpl::EnableFileDeletions(bool force) {
+Status BlobDBImpl::EnableFileDeletions() {
   // Enable base DB file deletions.
-  Status s = db_impl_->EnableFileDeletions(force);
+  Status s = db_impl_->EnableFileDeletions();
   if (!s.ok()) {
     return s;
   }
@@ -46,9 +44,7 @@ Status BlobDBImpl::EnableFileDeletions(bool force) {
   int count = 0;
   {
     MutexLock l(&delete_file_mutex_);
-    if (force) {
-      disable_file_deletions_ = 0;
-    } else if (disable_file_deletions_ > 0) {
+    if (disable_file_deletions_ > 0) {
       count = --disable_file_deletions_;
     }
     assert(count >= 0);
@@ -75,7 +71,7 @@ Status BlobDBImpl::GetLiveFiles(std::vector<std::string>& ret,
     return s;
   }
   ret.reserve(ret.size() + blob_files_.size());
-  for (auto bfile_pair : blob_files_) {
+  for (const auto& bfile_pair : blob_files_) {
     auto blob_file = bfile_pair.second;
     // Path should be relative to db_name, but begin with slash.
     ret.emplace_back(
@@ -90,10 +86,10 @@ void BlobDBImpl::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
   // Hold a lock in the beginning to avoid updates to base DB during the call
   ReadLock rl(&mutex_);
   db_->GetLiveFilesMetaData(metadata);
-  for (auto bfile_pair : blob_files_) {
+  for (const auto& bfile_pair : blob_files_) {
     auto blob_file = bfile_pair.second;
     LiveFileMetaData filemetadata;
-    filemetadata.size = static_cast<size_t>(blob_file->GetFileSize());
+    filemetadata.size = blob_file->GetFileSize();
     const uint64_t file_number = blob_file->BlobFileNumber();
     // Path should be relative to db_name, but begin with slash.
     filemetadata.name = BlobFileName("", bdb_options_.blob_dir, file_number);
@@ -108,6 +104,4 @@ void BlobDBImpl::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
   }
 }
 
-}  // namespace blob_db
-}  // namespace ROCKSDB_NAMESPACE
-#endif  // !ROCKSDB_LITE
+}  // namespace ROCKSDB_NAMESPACE::blob_db

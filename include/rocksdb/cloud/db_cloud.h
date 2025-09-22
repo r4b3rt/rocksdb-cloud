@@ -1,12 +1,11 @@
 //  Copyright (c) 2017-present, Rockset
 
 #pragma once
-#ifndef ROCKSDB_LITE
 
 #include <string>
 #include <vector>
 
-#include "rocksdb/cloud/cloud_env_options.h"
+#include "rocksdb/cloud/cloud_file_system.h"
 #include "rocksdb/db.h"
 #include "rocksdb/utilities/stackable_db.h"
 
@@ -24,8 +23,9 @@ class DBCloud : public StackableDB {
   // This API is to open a DB when key-values are to be made durable by
   // backing up database state into a cloud-storage system like S3.
   // All kv updates are persisted in cloud-storage.
-  // options.env is an object of type ROCKSDB_NAMESPACE::CloudEnv and the cloud
-  // buckets are specified there.
+  // options.env->GetFileSystem() is an object of type
+  // ROCKSDB_NAMESPACE::CloudFileSystem and the cloud buckets are specified
+  // there.
   static Status Open(const Options& options, const std::string& name,
                      const std::string& persistent_cache_path,
                      const uint64_t persistent_cache_size_gb, DBCloud** dbptr,
@@ -55,13 +55,6 @@ class DBCloud : public StackableDB {
   virtual Status CheckpointToCloud(const BucketOptions& destination,
                                    const CheckpointToCloudOptions& options) = 0;
 
-  // Executes an external compaction request on this cloud  database.
-  // The output pathnames returned in PluggableCompactionResult are the
-  // cloud path names.
-  virtual Status ExecuteRemoteCompactionRequest(
-      const PluggableCompactionParam& inputParams,
-      PluggableCompactionResult* result, bool sanitize) = 0;
-
   // ListColumnFamilies will open the DB specified by argument name
   // and return the list of all column families in that DB
   // through column_families argument. The ordering of
@@ -77,4 +70,3 @@ class DBCloud : public StackableDB {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-#endif  // ROCKSDB_LITE

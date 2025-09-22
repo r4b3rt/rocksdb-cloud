@@ -7,8 +7,10 @@
 
 #include "db/log_reader.h"
 #include "db/log_writer.h"
+#include "port/port_posix.h"
 
 namespace ROCKSDB_NAMESPACE {
+
 
 // Cloud manifest holds the information about mapping between original file
 // names and their suffixes.
@@ -33,24 +35,33 @@ namespace ROCKSDB_NAMESPACE {
 // CloudManifest is thread safe after Finalize() is called.
 class CloudManifest {
  public:
-  static Status LoadFromLog(std::unique_ptr<SequentialFileReader> log,
-                            std::unique_ptr<CloudManifest>* manifest);
+  static IOStatus LoadFromLog(std::unique_ptr<SequentialFileReader> log,
+                              std::unique_ptr<CloudManifest>* manifest);
   // Creates CloudManifest for an empty database
-  static Status CreateForEmptyDatabase(
+  static IOStatus CreateForEmptyDatabase(
       std::string currentEpoch, std::unique_ptr<CloudManifest>* manifest);
 
-  Status WriteToLog(std::unique_ptr<WritableFileWriter> log);
+  std::unique_ptr<CloudManifest> clone() const;
+
+  IOStatus WriteToLog(std::unique_ptr<WritableFileWriter> log) const;
 
   // Add an epoch that starts with startFileNumber and is identified by epochId.
   // GetEpoch(startFileNumber) == epochId
-  // Invalid call if finalized_ is false
-  void AddEpoch(uint64_t startFileNumber, std::string epochId);
+  //
+  // AddEpoch is idempotent, which means:
+  // - we can't add an epoch with smaller `startFileNumber`
+  // - we can't add an epoch which equals current epoch and starts at
+  // same file number
+  //
+  // Idempotency is based on the assumption that epochs added don't diverge from
+  // existing epochs(same sequence of <filenumm, epoch> is re-added)
+  bool AddEpoch(uint64_t startFileNumber, std::string epochId);
 
-  // Make the CloudManifest immutable and thread-safe
-  void Finalize();
-  Slice GetEpoch(uint64_t fileNumber) const;
-  Slice GetCurrentEpoch() const { return Slice(currentEpoch_); }
-  std::string ToString() const;
+  std::string GetEpoch(uint64_t fileNumber);
+
+  std::string GetCurrentEpoch();
+  std::string ToString(bool include_past_epochs=false);
+  std::vector<std::pair<uint64_t, std::string>> TEST_GetPastEpochs() const;
 
  private:
   CloudManifest(std::vector<std::pair<uint64_t, std::string>> pastEpochs,
@@ -58,12 +69,13 @@ class CloudManifest {
       : pastEpochs_(std::move(pastEpochs)),
         currentEpoch_(std::move(currentEpoch)) {}
 
+  mutable port::RWMutex mutex_;
+
   // sorted
   // a set of (fileNumber, epochId) where fileNumber is the last file number
   // (exclusive) of an epoch
   std::vector<std::pair<uint64_t, std::string>> pastEpochs_;
   std::string currentEpoch_;
-  bool finalized_{false};
 
   static constexpr uint32_t kCurrentFormatVersion = 1;
 };

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
+#include "logging/logging.h"
 #include "port/port.h"
 #include "rocksdb/env.h"
 #include "rocksdb/sst_file_manager.h"
@@ -17,7 +18,6 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-#ifndef ROCKSDB_LITE
 SstFileManagerImpl::SstFileManagerImpl(
     const std::shared_ptr<SystemClock>& clock,
     const std::shared_ptr<FileSystem>& fs,
@@ -160,9 +160,8 @@ bool SstFileManagerImpl::EnoughRoomForCompaction(
 
   // Update cur_compactions_reserved_size_ so concurrent compaction
   // don't max out space
-  size_t needed_headroom =
-      cur_compactions_reserved_size_ + size_added_by_compaction +
-      compaction_buffer_size_;
+  size_t needed_headroom = cur_compactions_reserved_size_ +
+                           size_added_by_compaction + compaction_buffer_size_;
   if (max_allowed_space_ != 0 &&
       (needed_headroom + total_files_size_ > max_allowed_space_)) {
     return false;
@@ -255,7 +254,7 @@ void SstFileManagerImpl::ClearError() {
   while (true) {
     MutexLock l(&mu_);
 
-    if (closing_) {
+    if (error_handler_list_.empty() || closing_) {
       return;
     }
 
@@ -296,7 +295,8 @@ void SstFileManagerImpl::ClearError() {
 
     // Someone could have called CancelErrorRecovery() and the list could have
     // become empty, so check again here
-    if (s.ok() && !error_handler_list_.empty()) {
+    if (s.ok()) {
+      assert(!error_handler_list_.empty());
       auto error_handler = error_handler_list_.front();
       // Since we will release the mutex, set cur_instance_ to signal to the
       // shutdown thread, if it calls // CancelErrorRecovery() the meantime,
@@ -317,7 +317,7 @@ void SstFileManagerImpl::ClearError() {
         // error is also a NoSpace() non-fatal error, leave the instance in
         // the list
         Status err = cur_instance_->GetBGError();
-        if (s.ok() && err == Status::NoSpace() &&
+        if (s.ok() && err.subcode() == IOStatus::SubCode::kNoSpace &&
             err.severity() < Status::Severity::kFatalError) {
           s = err;
         }
@@ -413,13 +413,12 @@ bool SstFileManagerImpl::CancelErrorRecovery(ErrorHandler* handler) {
   return false;
 }
 
-Status SstFileManagerImpl::ScheduleFileDeletion(
-    const std::string& file_path, const std::string& path_to_sync,
-    const bool force_bg) {
+Status SstFileManagerImpl::ScheduleFileDeletion(const std::string& file_path,
+                                                const std::string& path_to_sync,
+                                                const bool force_bg) {
   TEST_SYNC_POINT_CALLBACK("SstFileManagerImpl::ScheduleFileDeletion",
                            const_cast<std::string*>(&file_path));
-  return delete_scheduler_.DeleteFile(file_path, path_to_sync,
-                                      force_bg);
+  return delete_scheduler_.DeleteFile(file_path, path_to_sync, force_bg);
 }
 
 void SstFileManagerImpl::WaitForEmptyTrash() {
@@ -504,22 +503,5 @@ SstFileManager* NewSstFileManager(Env* env, std::shared_ptr<FileSystem> fs,
   return res;
 }
 
-#else
-
-SstFileManager* NewSstFileManager(Env* /*env*/,
-                                  std::shared_ptr<Logger> /*info_log*/,
-                                  std::string /*trash_dir*/,
-                                  int64_t /*rate_bytes_per_sec*/,
-                                  bool /*delete_existing_trash*/,
-                                  Status* status, double /*max_trash_db_ratio*/,
-                                  uint64_t /*bytes_max_delete_chunk*/) {
-  if (status) {
-    *status =
-        Status::NotSupported("SstFileManager is not supported in ROCKSDB_LITE");
-  }
-  return nullptr;
-}
-
-#endif  // ROCKSDB_LITE
 
 }  // namespace ROCKSDB_NAMESPACE

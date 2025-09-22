@@ -5,14 +5,12 @@
 
 #pragma once
 
-#ifndef ROCKSDB_LITE
 
 #include <string>
 
-#include "port/port.h"
-
 #include "db/compaction/compaction.h"
 #include "file/delete_scheduler.h"
+#include "port/port.h"
 #include "rocksdb/sst_file_manager.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -90,16 +88,16 @@ class SstFileManagerImpl : public SstFileManager {
   std::unordered_map<std::string, uint64_t> GetTrackedFiles() override;
 
   // Return delete rate limit in bytes per second.
-  virtual int64_t GetDeleteRateBytesPerSecond() override;
+  int64_t GetDeleteRateBytesPerSecond() override;
 
   // Update the delete rate limit in bytes per second.
-  virtual void SetDeleteRateBytesPerSecond(int64_t delete_rate) override;
+  void SetDeleteRateBytesPerSecond(int64_t delete_rate) override;
 
   // Return trash/DB size ratio where new files will be deleted immediately
-  virtual double GetMaxTrashDBRatio() override;
+  double GetMaxTrashDBRatio() override;
 
   // Update trash/DB size ratio where new files will be deleted immediately
-  virtual void SetMaxTrashDBRatio(double ratio) override;
+  void SetMaxTrashDBRatio(double ratio) override;
 
   // Return the total size of trash files
   uint64_t GetTotalTrashSize() override;
@@ -166,7 +164,7 @@ class SstFileManagerImpl : public SstFileManager {
   std::unordered_map<std::string, uint64_t> tracked_files_;
   // The maximum allowed space (in bytes) for sst and blob files.
   uint64_t max_allowed_space_;
-  // DeleteScheduler used to throttle file deletition.
+  // DeleteScheduler used to throttle file deletion.
   DeleteScheduler delete_scheduler_;
   port::CondVar cv_;
   // Flag to force error recovery thread to exit
@@ -193,4 +191,3 @@ class SstFileManagerImpl : public SstFileManager {
 
 }  // namespace ROCKSDB_NAMESPACE
 
-#endif  // ROCKSDB_LITE

@@ -21,11 +21,15 @@ struct ImmutableDBOptions {
   void Dump(Logger* log) const;
 
   bool create_if_missing;
+  std::shared_ptr<ReplicationLogListener> replication_log_listener;
+  std::shared_ptr<ReplicationEpochExtractor> replication_epoch_extractor;
   bool create_missing_column_families;
   bool error_if_exists;
   bool paranoid_checks;
   bool flush_verify_memtable_count;
+  bool compaction_verify_record_count;
   bool track_and_verify_wals_in_manifest;
+  bool verify_sst_unique_id_in_manifest;
   Env* env;
   std::shared_ptr<RateLimiter> rate_limiter;
   std::shared_ptr<SstFileManager> sst_file_manager;
@@ -36,6 +40,9 @@ struct ImmutableDBOptions {
   bool use_fsync;
   std::vector<DbPath> db_paths;
   std::string db_log_dir;
+  // The wal_dir option from the file.  To determine the
+  // directory in use, the GetWalDir or IsWalDirSameAsDBPath
+  // methods should be used instead of accessing this variable directly.
   std::string wal_dir;
   size_t max_log_file_size;
   size_t log_file_time_to_roll;
@@ -56,8 +63,6 @@ struct ImmutableDBOptions {
   bool advise_random_on_open;
   size_t db_write_buffer_size;
   std::shared_ptr<WriteBufferManager> write_buffer_manager;
-  DBOptions::AccessHint access_hint_on_compaction_start;
-  bool new_table_reader_for_compaction_inputs;
   size_t random_access_max_buffer_size;
   bool use_adaptive_mutex;
   std::vector<std::shared_ptr<EventListener>> listeners;
@@ -73,17 +78,15 @@ struct ImmutableDBOptions {
   WALRecoveryMode wal_recovery_mode;
   bool allow_2pc;
   std::shared_ptr<Cache> row_cache;
-#ifndef ROCKSDB_LITE
   WalFilter* wal_filter;
-#endif  // ROCKSDB_LITE
   bool fail_if_options_file_error;
   bool use_options_file;
   bool dump_malloc_stats;
   bool avoid_flush_during_recovery;
   bool allow_ingest_behind;
-  bool preserve_deletes;
   bool two_write_queues;
   bool manual_wal_flush;
+  CompressionType wal_compression;
   bool atomic_flush;
   bool avoid_unnecessary_blocking_io;
   bool persist_stats_to_disk;
@@ -97,24 +100,32 @@ struct ImmutableDBOptions {
   bool disable_manifest_sync;
   std::string db_host_id;
   FileTypeSet checksum_handoff_file_types;
+  CacheTier lowest_used_cache_tier;
   // Convenience/Helper objects that are not part of the base DBOptions
   std::shared_ptr<FileSystem> fs;
   SystemClock* clock;
   Statistics* stats;
   Logger* logger;
   std::shared_ptr<CompactionService> compaction_service;
+  bool enforce_single_del_contracts;
+  bool disable_delete_obsolete_files_on_open;
+  uint32_t max_num_replication_epochs;
+  bool attempt_recovery_after_manifest_write_error;
+
+  bool IsWalDirSameAsDBPath() const;
+  bool IsWalDirSameAsDBPath(const std::string& path) const;
+  const std::string& GetWalDir() const;
+  const std::string& GetWalDir(const std::string& path) const;
 };
 
 struct MutableDBOptions {
   static const char* kName() { return "MutableDBOptions"; }
   MutableDBOptions();
-  explicit MutableDBOptions(const MutableDBOptions& options) = default;
   explicit MutableDBOptions(const DBOptions& options);
 
   void Dump(Logger* log) const;
 
   int max_background_jobs;
-  int base_background_compactions;
   int max_background_compactions;
   uint32_t max_subcompactions;
   bool avoid_flush_during_shutdown;
@@ -131,9 +142,9 @@ struct MutableDBOptions {
   bool strict_bytes_per_sync;
   size_t compaction_readahead_size;
   int max_background_flushes;
+  std::string daily_offpeak_time_utc;
 };
 
-#ifndef ROCKSDB_LITE
 Status GetStringFromMutableDBOptions(const ConfigOptions& config_options,
                                      const MutableDBOptions& mutable_opts,
                                      std::string* opt_string);
@@ -142,6 +153,8 @@ Status GetMutableDBOptionsFromStrings(
     const MutableDBOptions& base_options,
     const std::unordered_map<std::string, std::string>& options_map,
     MutableDBOptions* new_options);
-#endif  // ROCKSDB_LITE
+
+bool MutableDBOptionsAreEqual(const MutableDBOptions& this_options,
+                              const MutableDBOptions& that_options);
 
 }  // namespace ROCKSDB_NAMESPACE

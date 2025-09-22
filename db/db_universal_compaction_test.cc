@@ -7,11 +7,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <string>
+
 #include "db/db_test_util.h"
 #include "port/stack_trace.h"
-#if !defined(ROCKSDB_LITE)
 #include "rocksdb/utilities/table_properties_collectors.h"
+#include "test_util/mock_time_env.h"
 #include "test_util/sync_point.h"
+#include "test_util/testutil.h"
 #include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -38,14 +41,14 @@ class DBTestUniversalCompactionBase
 
 class DBTestUniversalCompaction : public DBTestUniversalCompactionBase {
  public:
-  DBTestUniversalCompaction() :
-      DBTestUniversalCompactionBase("/db_universal_compaction_test") {}
+  DBTestUniversalCompaction()
+      : DBTestUniversalCompactionBase("/db_universal_compaction_test") {}
 };
 
 class DBTestUniversalCompaction2 : public DBTestBase {
  public:
   DBTestUniversalCompaction2()
-      : DBTestBase("/db_universal_compaction_test2", /*env_do_fsync=*/false) {}
+      : DBTestBase("db_universal_compaction_test2", /*env_do_fsync=*/false) {}
 };
 
 namespace {
@@ -92,7 +95,7 @@ class KeepFilterFactory : public CompactionFilterFactory {
   std::atomic_bool expect_full_compaction_;
   std::atomic_bool expect_manual_compaction_;
 };
-}  // namespace
+}  // anonymous namespace
 
 // Make sure we don't trigger a problem if the trigger condtion is given
 // to be 0, which is invalid.
@@ -151,7 +154,7 @@ TEST_P(DBTestUniversalCompaction, OptimizeFiltersForHits) {
   options.table_factory.reset(NewBlockBasedTableFactory(bbto));
   options.optimize_filters_for_hits = true;
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
-  options.memtable_factory.reset(new SpecialSkipListFactory(3));
+  options.memtable_factory.reset(test::NewSpecialSkipListFactory(3));
 
   DestroyAndReopen(options);
 
@@ -548,22 +551,21 @@ TEST_P(DBTestUniversalCompaction, CompactFilesOnUniversalCompaction) {
   ASSERT_EQ(options.compaction_style, kCompactionStyleUniversal);
   Random rnd(301);
   for (int key = 1024 * kEntriesPerBuffer; key >= 0; --key) {
-    ASSERT_OK(Put(1, ToString(key), rnd.RandomString(kTestValueSize)));
+    ASSERT_OK(Put(1, std::to_string(key), rnd.RandomString(kTestValueSize)));
   }
   ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[1]));
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   ColumnFamilyMetaData cf_meta;
   dbfull()->GetColumnFamilyMetaData(handles_[1], &cf_meta);
   std::vector<std::string> compaction_input_file_names;
-  for (auto file : cf_meta.levels[0].files) {
+  for (const auto& file : cf_meta.levels[0].files) {
     if (rnd.OneIn(2)) {
       compaction_input_file_names.push_back(file.name);
     }
   }
 
   if (compaction_input_file_names.size() == 0) {
-    compaction_input_file_names.push_back(
-        cf_meta.levels[0].files[0].name);
+    compaction_input_file_names.push_back(cf_meta.levels[0].files[0].name);
   }
 
   // expect fail since universal compaction only allow L0 output
@@ -573,28 +575,23 @@ TEST_P(DBTestUniversalCompaction, CompactFilesOnUniversalCompaction) {
                    .ok());
 
   // expect ok and verify the compacted files no longer exist.
-  ASSERT_OK(dbfull()->CompactFiles(
-      CompactionOptions(), handles_[1],
-      compaction_input_file_names, 0));
+  ASSERT_OK(dbfull()->CompactFiles(CompactionOptions(), handles_[1],
+                                   compaction_input_file_names, 0));
 
   dbfull()->GetColumnFamilyMetaData(handles_[1], &cf_meta);
   VerifyCompactionResult(
-      cf_meta,
-      std::set<std::string>(compaction_input_file_names.begin(),
-          compaction_input_file_names.end()));
+      cf_meta, std::set<std::string>(compaction_input_file_names.begin(),
+                                     compaction_input_file_names.end()));
 
   compaction_input_file_names.clear();
 
   // Pick the first and the last file, expect everything is
   // compacted into one single file.
+  compaction_input_file_names.push_back(cf_meta.levels[0].files[0].name);
   compaction_input_file_names.push_back(
-      cf_meta.levels[0].files[0].name);
-  compaction_input_file_names.push_back(
-      cf_meta.levels[0].files[
-          cf_meta.levels[0].files.size() - 1].name);
-  ASSERT_OK(dbfull()->CompactFiles(
-      CompactionOptions(), handles_[1],
-      compaction_input_file_names, 0));
+      cf_meta.levels[0].files[cf_meta.levels[0].files.size() - 1].name);
+  ASSERT_OK(dbfull()->CompactFiles(CompactionOptions(), handles_[1],
+                                   compaction_input_file_names, 0));
 
   dbfull()->GetColumnFamilyMetaData(handles_[1], &cf_meta);
   ASSERT_EQ(cf_meta.levels[0].files.size(), 1U);
@@ -603,7 +600,7 @@ TEST_P(DBTestUniversalCompaction, CompactFilesOnUniversalCompaction) {
 TEST_P(DBTestUniversalCompaction, UniversalCompactionTargetLevel) {
   Options options = CurrentOptions();
   options.compaction_style = kCompactionStyleUniversal;
-  options.write_buffer_size = 100 << 10;     // 100KB
+  options.write_buffer_size = 100 << 10;  // 100KB
   options.num_levels = 7;
   options.disable_auto_compactions = true;
   DestroyAndReopen(options);
@@ -635,13 +632,13 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionTargetLevel) {
   ASSERT_EQ("0,0,0,0,1", FilesPerLevel(0));
 }
 
-#ifndef ROCKSDB_VALGRIND_RUN
+#if !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 class DBTestUniversalCompactionMultiLevels
     : public DBTestUniversalCompactionBase {
  public:
-  DBTestUniversalCompactionMultiLevels() :
-      DBTestUniversalCompactionBase(
-          "/db_universal_compaction_multi_levels_test") {}
+  DBTestUniversalCompactionMultiLevels()
+      : DBTestUniversalCompactionBase(
+            "/db_universal_compaction_multi_levels_test") {}
 };
 
 TEST_P(DBTestUniversalCompactionMultiLevels, UniversalCompactionMultiLevels) {
@@ -724,18 +721,18 @@ INSTANTIATE_TEST_CASE_P(MultiLevels, DBTestUniversalCompactionMultiLevels,
                         ::testing::Combine(::testing::Values(3, 20),
                                            ::testing::Bool()));
 
-class DBTestUniversalCompactionParallel :
-    public DBTestUniversalCompactionBase {
+class DBTestUniversalCompactionParallel : public DBTestUniversalCompactionBase {
  public:
-  DBTestUniversalCompactionParallel() :
-      DBTestUniversalCompactionBase(
-          "/db_universal_compaction_prallel_test") {}
+  DBTestUniversalCompactionParallel()
+      : DBTestUniversalCompactionBase("/db_universal_compaction_prallel_test") {
+  }
 };
 
 TEST_P(DBTestUniversalCompactionParallel, UniversalCompactionParallel) {
   Options options = CurrentOptions();
   options.compaction_style = kCompactionStyleUniversal;
   options.num_levels = num_levels_;
+  options.env = env_;
   options.write_buffer_size = 1 << 10;  // 1KB
   options.level0_file_num_compaction_trigger = 3;
   options.max_background_compactions = 3;
@@ -912,13 +909,13 @@ TEST_P(DBTestUniversalCompactionParallel, PickByFileNumberBug) {
 INSTANTIATE_TEST_CASE_P(Parallel, DBTestUniversalCompactionParallel,
                         ::testing::Combine(::testing::Values(1, 10),
                                            ::testing::Values(false)));
-#endif  // ROCKSDB_VALGRIND_RUN
+#endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 
 TEST_P(DBTestUniversalCompaction, UniversalCompactionOptions) {
   Options options = CurrentOptions();
   options.compaction_style = kCompactionStyleUniversal;
-  options.write_buffer_size = 105 << 10;    // 105KB
-  options.arena_block_size = 4 << 10;       // 4KB
+  options.write_buffer_size = 105 << 10;     // 105KB
+  options.arena_block_size = 4 << 10;        // 4KB
   options.target_file_size_base = 32 << 10;  // 32KB
   options.level0_file_num_compaction_trigger = 4;
   options.num_levels = num_levels_;
@@ -949,8 +946,8 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionOptions) {
 TEST_P(DBTestUniversalCompaction, UniversalCompactionStopStyleSimilarSize) {
   Options options = CurrentOptions();
   options.compaction_style = kCompactionStyleUniversal;
-  options.write_buffer_size = 105 << 10;    // 105KB
-  options.arena_block_size = 4 << 10;       // 4KB
+  options.write_buffer_size = 105 << 10;     // 105KB
+  options.arena_block_size = 4 << 10;        // 4KB
   options.target_file_size_base = 32 << 10;  // 32KB
   // trigger compaction if there are >= 4 files
   options.level0_file_num_compaction_trigger = 4;
@@ -1128,7 +1125,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionCompressRatio2) {
   ASSERT_LT(TotalSize(), 120000U * 12 * 0.82 + 120000 * 2);
 }
 
-#ifndef ROCKSDB_VALGRIND_RUN
+#if !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 // Test that checks trivial move in universal compaction
 TEST_P(DBTestUniversalCompaction, UniversalCompactionTrivialMoveTest1) {
   int32_t trivial_move = 0;
@@ -1221,7 +1218,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionTrivialMoveTest2) {
 
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
-#endif  // ROCKSDB_VALGRIND_RUN
+#endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 
 TEST_P(DBTestUniversalCompaction, UniversalCompactionFourPaths) {
   Options options = CurrentOptions();
@@ -1230,7 +1227,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionFourPaths) {
   options.db_paths.emplace_back(dbname_ + "_3", 500 * 1024);
   options.db_paths.emplace_back(dbname_ + "_4", 1024 * 1024 * 1024);
   options.memtable_factory.reset(
-      new SpecialSkipListFactory(KNumKeysByGenerateNewFile - 1));
+      test::NewSpecialSkipListFactory(KNumKeysByGenerateNewFile - 1));
   options.compaction_style = kCompactionStyleUniversal;
   options.compaction_options_universal.size_ratio = 5;
   options.write_buffer_size = 111 << 10;  // 114KB
@@ -1334,7 +1331,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionCFPathUse) {
   options.db_paths.emplace_back(dbname_ + "_3", 500 * 1024);
   options.db_paths.emplace_back(dbname_ + "_4", 1024 * 1024 * 1024);
   options.memtable_factory.reset(
-      new SpecialSkipListFactory(KNumKeysByGenerateNewFile - 1));
+      test::NewSpecialSkipListFactory(KNumKeysByGenerateNewFile - 1));
   options.compaction_style = kCompactionStyleUniversal;
   options.compaction_options_universal.size_ratio = 10;
   options.write_buffer_size = 111 << 10;  // 114KB
@@ -1351,7 +1348,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionCFPathUse) {
   cf_opt1.cf_paths.emplace_back(dbname_ + "cf1_3", 500 * 1024);
   cf_opt1.cf_paths.emplace_back(dbname_ + "cf1_4", 1024 * 1024 * 1024);
   option_vector.emplace_back(DBOptions(options), cf_opt1);
-  CreateColumnFamilies({"one"},option_vector[1]);
+  CreateColumnFamilies({"one"}, option_vector[1]);
 
   // Configura CF2 specific paths.
   cf_opt2.cf_paths.emplace_back(dbname_ + "cf2", 300 * 1024);
@@ -1359,7 +1356,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionCFPathUse) {
   cf_opt2.cf_paths.emplace_back(dbname_ + "cf2_3", 500 * 1024);
   cf_opt2.cf_paths.emplace_back(dbname_ + "cf2_4", 1024 * 1024 * 1024);
   option_vector.emplace_back(DBOptions(options), cf_opt2);
-  CreateColumnFamilies({"two"},option_vector[2]);
+  CreateColumnFamilies({"two"}, option_vector[2]);
 
   ReopenWithColumnFamilies({"default", "one", "two"}, option_vector);
 
@@ -1475,6 +1472,7 @@ TEST_P(DBTestUniversalCompaction, IncreaseUniversalCompactionNumLevels) {
       keys_in_db.append(iter->key().ToString());
       keys_in_db.push_back(',');
     }
+    EXPECT_OK(iter->status());
     delete iter;
 
     std::string expected_keys;
@@ -1498,7 +1496,8 @@ TEST_P(DBTestUniversalCompaction, IncreaseUniversalCompactionNumLevels) {
   options.num_levels = 1;
   options.write_buffer_size = 200 << 10;  // 200KB
   options.level0_file_num_compaction_trigger = 3;
-  options.memtable_factory.reset(new SpecialSkipListFactory(KNumKeysPerFile));
+  options.memtable_factory.reset(
+      test::NewSpecialSkipListFactory(KNumKeysPerFile));
   options = CurrentOptions(options);
   CreateAndReopenWithCF({"pikachu"}, options);
 
@@ -1564,7 +1563,6 @@ TEST_P(DBTestUniversalCompaction, IncreaseUniversalCompactionNumLevels) {
   verify_func(max_key3);
 }
 
-
 TEST_P(DBTestUniversalCompaction, UniversalCompactionSecondPathRatio) {
   if (!Snappy_Supported()) {
     return;
@@ -1579,7 +1577,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionSecondPathRatio) {
   options.level0_file_num_compaction_trigger = 2;
   options.num_levels = 1;
   options.memtable_factory.reset(
-      new SpecialSkipListFactory(KNumKeysByGenerateNewFile - 1));
+      test::NewSpecialSkipListFactory(KNumKeysByGenerateNewFile - 1));
 
   std::vector<std::string> filenames;
   if (env_->GetChildren(options.db_paths[1].path, &filenames).ok()) {
@@ -1677,6 +1675,7 @@ TEST_P(DBTestUniversalCompaction, ConcurrentBottomPriLowPriCompactions) {
   Env::Default()->SetBackgroundThreads(1, Env::Priority::BOTTOM);
   Options options = CurrentOptions();
   options.compaction_style = kCompactionStyleUniversal;
+  options.max_background_compactions = 2;
   options.num_levels = num_levels_;
   options.write_buffer_size = 100 << 10;     // 100KB
   options.target_file_size_base = 32 << 10;  // 32KB
@@ -1685,6 +1684,10 @@ TEST_P(DBTestUniversalCompaction, ConcurrentBottomPriLowPriCompactions) {
   options.compaction_options_universal.max_size_amplification_percent = 110;
   DestroyAndReopen(options);
 
+  // Need to get a token to enable compaction parallelism up to
+  // `max_background_compactions` jobs.
+  auto pressure_token =
+      dbfull()->TEST_write_controler().GetCompactionPressureToken();
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency(
       {// wait for the full compaction to be picked before adding files intended
        // for the second one.
@@ -1729,7 +1732,7 @@ TEST_P(DBTestUniversalCompaction, RecalculateScoreAfterPicking) {
   const int kNumFilesTrigger = 8;
   Options options = CurrentOptions();
   options.memtable_factory.reset(
-      new SpecialSkipListFactory(KNumKeysByGenerateNewFile - 1));
+      test::NewSpecialSkipListFactory(KNumKeysByGenerateNewFile - 1));
   options.compaction_options_universal.max_merge_width = kNumFilesTrigger / 2;
   options.compaction_options_universal.max_size_amplification_percent =
       static_cast<unsigned int>(-1);
@@ -1821,9 +1824,9 @@ INSTANTIATE_TEST_CASE_P(NumLevels, DBTestUniversalCompaction,
 class DBTestUniversalManualCompactionOutputPathId
     : public DBTestUniversalCompactionBase {
  public:
-  DBTestUniversalManualCompactionOutputPathId() :
-      DBTestUniversalCompactionBase(
-          "/db_universal_compaction_manual_pid_test") {}
+  DBTestUniversalManualCompactionOutputPathId()
+      : DBTestUniversalCompactionBase(
+            "/db_universal_compaction_manual_pid_test") {}
 };
 
 TEST_P(DBTestUniversalManualCompactionOutputPathId,
@@ -1851,31 +1854,31 @@ TEST_P(DBTestUniversalManualCompactionOutputPathId,
   compact_options.exclusive_manual_compaction = exclusive_manual_compaction_;
   ASSERT_OK(db_->CompactRange(compact_options, handles_[1], nullptr, nullptr));
   ASSERT_EQ(1, TotalLiveFiles(1));
-  ASSERT_EQ(0, GetSstFileCount(options.db_paths[0].path));
-  ASSERT_EQ(1, GetSstFileCount(options.db_paths[1].path));
+  ASSERT_EQ(0, TotalLiveFilesAtPath(1, options.db_paths[0].path));
+  ASSERT_EQ(1, TotalLiveFilesAtPath(1, options.db_paths[1].path));
 
   ReopenWithColumnFamilies({kDefaultColumnFamilyName, "pikachu"}, options);
   ASSERT_EQ(1, TotalLiveFiles(1));
-  ASSERT_EQ(0, GetSstFileCount(options.db_paths[0].path));
-  ASSERT_EQ(1, GetSstFileCount(options.db_paths[1].path));
+  ASSERT_EQ(0, TotalLiveFilesAtPath(1, options.db_paths[0].path));
+  ASSERT_EQ(1, TotalLiveFilesAtPath(1, options.db_paths[1].path));
 
   MakeTables(1, "p", "q", 1);
   ASSERT_EQ(2, TotalLiveFiles(1));
-  ASSERT_EQ(1, GetSstFileCount(options.db_paths[0].path));
-  ASSERT_EQ(1, GetSstFileCount(options.db_paths[1].path));
+  ASSERT_EQ(1, TotalLiveFilesAtPath(1, options.db_paths[0].path));
+  ASSERT_EQ(1, TotalLiveFilesAtPath(1, options.db_paths[1].path));
 
   ReopenWithColumnFamilies({kDefaultColumnFamilyName, "pikachu"}, options);
   ASSERT_EQ(2, TotalLiveFiles(1));
-  ASSERT_EQ(1, GetSstFileCount(options.db_paths[0].path));
-  ASSERT_EQ(1, GetSstFileCount(options.db_paths[1].path));
+  ASSERT_EQ(1, TotalLiveFilesAtPath(1, options.db_paths[0].path));
+  ASSERT_EQ(1, TotalLiveFilesAtPath(1, options.db_paths[1].path));
 
   // Full compaction to DB path 0
   compact_options.target_path_id = 0;
   compact_options.exclusive_manual_compaction = exclusive_manual_compaction_;
   ASSERT_OK(db_->CompactRange(compact_options, handles_[1], nullptr, nullptr));
   ASSERT_EQ(1, TotalLiveFiles(1));
-  ASSERT_EQ(1, GetSstFileCount(options.db_paths[0].path));
-  ASSERT_EQ(0, GetSstFileCount(options.db_paths[1].path));
+  ASSERT_EQ(1, TotalLiveFilesAtPath(1, options.db_paths[0].path));
+  ASSERT_EQ(0, TotalLiveFilesAtPath(1, options.db_paths[1].path));
 
   // Fail when compacting to an invalid path ID
   compact_options.target_path_id = 2;
@@ -2146,7 +2149,19 @@ TEST_F(DBTestUniversalCompaction2, PeriodicCompactionDefault) {
   options.ttl = 60 * 24 * 60 * 60;
   options.compaction_filter = nullptr;
   Reopen(options);
-  ASSERT_EQ(60 * 24 * 60 * 60,
+  ASSERT_EQ(30 * 24 * 60 * 60,
+            dbfull()->GetOptions().periodic_compaction_seconds);
+
+  options.periodic_compaction_seconds = 45 * 24 * 60 * 60;
+  options.ttl = 50 * 24 * 60 * 60;
+  Reopen(options);
+  ASSERT_EQ(45 * 24 * 60 * 60,
+            dbfull()->GetOptions().periodic_compaction_seconds);
+
+  options.periodic_compaction_seconds = 0;
+  options.ttl = 50 * 24 * 60 * 60;
+  Reopen(options);
+  ASSERT_EQ(50 * 24 * 60 * 60,
             dbfull()->GetOptions().periodic_compaction_seconds);
 }
 
@@ -2172,7 +2187,7 @@ TEST_F(DBTestUniversalCompaction2, PeriodicCompaction) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "UniversalCompactionPicker::PickPeriodicCompaction:Return",
       [&](void* arg) {
-        Compaction* compaction = reinterpret_cast<Compaction*>(arg);
+        Compaction* compaction = static_cast<Compaction*>(arg);
         ASSERT_TRUE(arg != nullptr);
         ASSERT_TRUE(compaction->compaction_reason() ==
                     CompactionReason::kPeriodicCompaction);
@@ -2218,18 +2233,146 @@ TEST_F(DBTestUniversalCompaction2, PeriodicCompaction) {
   ASSERT_EQ(4, output_level);
 }
 
+TEST_F(DBTestUniversalCompaction2, PeriodicCompactionOffpeak) {
+  constexpr int kSecondsPerDay = 86400;
+  constexpr int kSecondsPerHour = 3600;
+  constexpr int kSecondsPerMinute = 60;
+
+  Options opts = CurrentOptions();
+  opts.compaction_style = kCompactionStyleUniversal;
+  opts.level0_file_num_compaction_trigger = 10;
+  opts.max_open_files = -1;
+  opts.compaction_options_universal.size_ratio = 10;
+  opts.compaction_options_universal.min_merge_width = 2;
+  opts.compaction_options_universal.max_size_amplification_percent = 200;
+  opts.periodic_compaction_seconds = 5 * kSecondsPerDay;  // 5 days
+  opts.num_levels = 5;
+
+  // Just to add some extra random days to current time
+  Random rnd(test::RandomSeed());
+  int days = rnd.Uniform(100);
+
+  int periodic_compactions = 0;
+  int start_level = -1;
+  int output_level = -1;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "UniversalCompactionPicker::PickPeriodicCompaction:Return",
+      [&](void* arg) {
+        Compaction* compaction = static_cast<Compaction*>(arg);
+        ASSERT_TRUE(arg != nullptr);
+        ASSERT_TRUE(compaction->compaction_reason() ==
+                    CompactionReason::kPeriodicCompaction);
+        start_level = compaction->start_level();
+        output_level = compaction->output_level();
+        periodic_compactions++;
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  for (std::string preset_offpeak_time : {"", "00:30-04:30", "10:30-02:30"}) {
+    SCOPED_TRACE("preset_offpeak_time=" + preset_offpeak_time);
+    for (std::string new_offpeak_time : {"", "23:30-02:30"}) {
+      SCOPED_TRACE("new_offpeak_time=" + new_offpeak_time);
+      std::vector<std::pair<int, int>> times_to_test = {
+          {0, 0}, {2, 30}, {3, 15}, {5, 10}, {13, 30}, {23, 30}};
+      for (std::pair<int, int> now : times_to_test) {
+        int now_hour = now.first;
+        int now_minute = now.second;
+        SCOPED_TRACE("now=" + std::to_string(now_hour) + ":" +
+                     std::to_string(now_minute));
+
+        auto mock_clock =
+            std::make_shared<MockSystemClock>(env_->GetSystemClock());
+        auto mock_env = std::make_unique<CompositeEnvWrapper>(env_, mock_clock);
+        opts.env = mock_env.get();
+        mock_clock->SetCurrentTime(days * kSecondsPerDay +
+                                   now_hour * kSecondsPerHour +
+                                   now_minute * kSecondsPerMinute);
+        opts.daily_offpeak_time_utc = preset_offpeak_time;
+        Reopen(opts);
+
+        ASSERT_OK(Put("foo", "bar1"));
+        ASSERT_OK(Flush());
+        ASSERT_EQ(0, periodic_compactions);
+
+        // Move clock forward by 8 hours. There should be no periodic
+        // compaction, yet.
+        mock_clock->MockSleepForSeconds(8 * kSecondsPerHour);
+        ASSERT_OK(Put("foo", "bar2"));
+        ASSERT_OK(Flush());
+        ASSERT_OK(dbfull()->TEST_WaitForCompact());
+        ASSERT_EQ(0, periodic_compactions);
+
+        // Move clock forward by 4 days
+        mock_clock->MockSleepForSeconds(4 * kSecondsPerDay);
+        ASSERT_OK(Put("foo", "bar3"));
+        ASSERT_OK(Flush());
+        ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+        int64_t mock_now;
+        ASSERT_OK(mock_clock->GetCurrentTime(&mock_now));
+
+        auto offpeak_time_info =
+            dbfull()->GetVersionSet()->offpeak_time_option().GetOffpeakTimeInfo(
+                mock_now);
+        // At this point, the first file is 4 days and 8 hours old.
+        // If it's offpeak now and the file is expected to expire before the
+        // next offpeak starts
+        if (offpeak_time_info.is_now_offpeak &&
+            offpeak_time_info.seconds_till_next_offpeak_start /
+                    kSecondsPerHour >
+                16) {
+          ASSERT_EQ(1, periodic_compactions);
+        } else {
+          ASSERT_EQ(0, periodic_compactions);
+          // Change offpeak option by SetDBOption()
+          if (preset_offpeak_time != new_offpeak_time) {
+            ASSERT_OK(dbfull()->SetDBOptions(
+                {{"daily_offpeak_time_utc", new_offpeak_time}}));
+            ASSERT_OK(Put("foo", "bar4"));
+            ASSERT_OK(Flush());
+            ASSERT_OK(dbfull()->TEST_WaitForCompact());
+            offpeak_time_info = dbfull()
+                                    ->GetVersionSet()
+                                    ->offpeak_time_option()
+                                    .GetOffpeakTimeInfo(mock_now);
+            // if the first file is now eligible to be picked up
+            if (offpeak_time_info.is_now_offpeak &&
+                offpeak_time_info.seconds_till_next_offpeak_start /
+                        kSecondsPerHour >
+                    16) {
+              ASSERT_OK(Put("foo", "bar5"));
+              ASSERT_OK(Flush());
+              ASSERT_OK(dbfull()->TEST_WaitForCompact());
+              ASSERT_EQ(1, periodic_compactions);
+            }
+          }
+
+          // If the file has not been picked up yet (no offpeak set, or offpeak
+          // set but then unset before the file becomes eligible)
+          if (periodic_compactions == 0) {
+            // move clock forward by one more day
+            mock_clock->MockSleepForSeconds(1 * kSecondsPerDay);
+            ASSERT_OK(Put("foo", "bar6"));
+            ASSERT_OK(Flush());
+            ASSERT_OK(dbfull()->TEST_WaitForCompact());
+          }
+        }
+        ASSERT_EQ(1, periodic_compactions);
+        ASSERT_EQ(0, start_level);
+        ASSERT_EQ(4, output_level);
+        Destroy(opts);
+
+        periodic_compactions = 0;
+      }
+    }
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
-#endif  // !defined(ROCKSDB_LITE)
 
 int main(int argc, char** argv) {
-#if !defined(ROCKSDB_LITE)
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
-#else
-  (void) argc;
-  (void) argv;
-  return 0;
-#endif
 }
